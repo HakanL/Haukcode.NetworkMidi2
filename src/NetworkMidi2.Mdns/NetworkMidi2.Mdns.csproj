@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Haukcode.NetworkMidi2.Mdns</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+
+    <!-- NuGet Metadata -->
+    <PackageId>Haukcode.NetworkMidi2.Mdns</PackageId>
+    <Version>0.1.0</Version>
+    <Title>Network MIDI 2.0 mDNS Discovery and Advertising for .NET</Title>
+    <Authors>Hakan Lindestaf</Authors>
+    <Description>mDNS peer discovery and advertising for Haukcode.NetworkMidi2. Browses the local network for _midi2._udp services and exposes found/lost peers as IObservable streams.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>© Copyright 2026 Hakan Lindestaf</Copyright>
+    <PackageProjectUrl>https://github.com/HakanL/Haukcode.NetworkMidi2</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/HakanL/Haukcode.NetworkMidi2</RepositoryUrl>
+    <PackageTags>midi midi2 network-midi-2 mdns discovery advertising</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Haukcode.Mdns" Version="1.0.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetworkMidi2.csproj" />
+  </ItemGroup>
+</Project>

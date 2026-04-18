@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Haukcode.NetworkMidi2.Sample</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\NetworkMidi2.csproj" />
+    <ProjectReference Include="..\..\src\NetworkMidi2.Mdns\NetworkMidi2.Mdns.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,15 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/tests/">
+    <Project Path="../tests/NetworkMidi2.Tests/NetworkMidi2.Tests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="../samples/NetworkMidi2.Sample/NetworkMidi2.Sample.csproj" />
+  </Folder>
+  <Project Path="NetworkMidi2.csproj" />
+  <Project Path="NetworkMidi2.Mdns/NetworkMidi2.Mdns.csproj" />
+</Solution>
