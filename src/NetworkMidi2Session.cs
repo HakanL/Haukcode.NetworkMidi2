@@ -1,6 +1,5 @@
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
-using System.Security.Cryptography;
 
 namespace Haukcode.NetworkMidi2;
 
@@ -20,11 +19,10 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     private const int HandshakeTimeoutMs    = 5_000;
 
     private readonly string localName;
-    private readonly uint   localInitiatorToken;
 
     /// <summary>
     /// Optional diagnostic hook. Set to a logger action to trace session events and
-    /// packet exchanges. Guard call sites with <c>if (TraceHook != null)</c>.
+    /// packet exchanges.
     /// </summary>
     public static Action<string>? TraceHook;
 
@@ -42,14 +40,14 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     private Task? receiveTask;
     private Task? pingTask;
 
-    // --- Outbound sequence tracking ---
-    private uint outboundSeqNum;
+    // --- Outbound sequence tracking (uint16, wraps at 0xFFFF) ---
+    private ushort outboundSeqNum;
 
     // --- FEC send-side history ---
     private readonly UmpFec.SendHistory fecHistory = new();
 
     // --- Inbound gap detection ---
-    private uint? expectedSeqNum;
+    private ushort? expectedSeqNum;
 
     // -------------------------------------------------------------------------
     // Construction
@@ -59,7 +57,6 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     public NetworkMidi2Session(string localName)
     {
         this.localName = localName;
-        localInitiatorToken = NetworkMidi2Protocol.GenerateInitiatorToken();
     }
 
     // -------------------------------------------------------------------------
@@ -93,14 +90,14 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             throw new InvalidOperationException($"Session is not idle (current state: {State}).");
 
         remoteEndPoint = endPoint;
-        outboundSeqNum = (uint)Random.Shared.NextInt64(0, uint.MaxValue);
+        outboundSeqNum = (ushort)Random.Shared.Next(0, ushort.MaxValue + 1);
         expectedSeqNum = null;
 
         socket = new UdpClient(0); // ephemeral local port
         socket.Connect(remoteEndPoint);
 
         if (TraceHook != null)
-            TraceHook($"[{localName}] ConnectAsync target={endPoint} token={localInitiatorToken:X8}");
+            TraceHook($"[{localName}] ConnectAsync target={endPoint}");
 
         State = SessionState.Connecting;
 
@@ -123,7 +120,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         if (State != SessionState.Idle)
             throw new InvalidOperationException($"Session is not idle (current state: {State}).");
 
-        outboundSeqNum = (uint)Random.Shared.NextInt64(0, uint.MaxValue);
+        outboundSeqNum = (ushort)Random.Shared.Next(0, ushort.MaxValue + 1);
         expectedSeqNum = null;
 
         socket = new UdpClient(port);
@@ -149,11 +146,9 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
-        uint seqNum  = outboundSeqNum++;
-        var history  = fecHistory.GetHistory();
-        var fecBlock = UmpFec.Encode(umpWords.Span, history);
-        var payload  = UmpDataCommand.EncodePayload(seqNum, fecBlock);
-        var datagram = NetworkMidi2Protocol.WrapWithHeader(NetworkMidi2Command.UmpData, payload);
+        ushort seqNum  = outboundSeqNum++;
+        var history    = fecHistory.GetHistory();
+        var datagram   = UmpFec.EncodeDatagram(seqNum, umpWords.Span, history);
 
         fecHistory.Record(seqNum, umpWords.ToArray());
 
@@ -179,7 +174,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         {
             try
             {
-                var bye = NetworkMidi2Protocol.Encode(new ByePacket(localInitiatorToken));
+                var bye = NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.UserTerminated));
                 if (TraceHook != null)
                     TraceHook($"[{localName}] TX Bye to {remoteEndPoint}");
                 await socket.SendAsync(bye);
@@ -264,8 +259,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     private async Task HandshakeAsClientAsync(CancellationToken ct)
     {
-        byte[]? pinHash = Pin != null ? NetworkMidi2Protocol.ComputePinHash(Pin) : null;
-        var invite  = new InvitationPacket(localInitiatorToken, localName, pinHash);
+        var invite  = new InvitationPacket(localName);
         var encoded = NetworkMidi2Protocol.Encode(invite);
 
         for (int attempt = 0; attempt < 3; attempt++)
@@ -287,19 +281,18 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
                     foreach (var cmd in cmds)
                     {
-                        if (cmd is InvitationAcceptedPacket accepted
-                            && accepted.InitiatorToken == localInitiatorToken)
+                        if (cmd is InvitationAcceptedPacket accepted)
                         {
-                            RemoteName = accepted.RemoteName;
+                            RemoteName = accepted.EndpointName;
                             if (TraceHook != null)
                                 TraceHook($"[{localName}] RX InvitationAccepted remote='{RemoteName}'");
                             return;
                         }
-                        if (cmd is InvitationRefusedPacket refused
-                            && refused.InitiatorToken == localInitiatorToken)
+
+                        if (cmd is ByePacket bye)
                         {
                             throw new InvalidOperationException(
-                                $"Remote refused invitation: {refused.Reason}");
+                                $"Remote refused invitation: {bye.Reason}");
                         }
                     }
                 }
@@ -329,27 +322,19 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 if (cmd is not InvitationPacket invite) continue;
 
                 if (TraceHook != null)
-                    TraceHook($"[{localName}] RX Invitation from {result.RemoteEndPoint} name='{invite.LocalName}'");
+                    TraceHook($"[{localName}] RX Invitation from {result.RemoteEndPoint} name='{invite.EndpointName}'");
 
-                // PIN check
+                // Reject if PIN is required (auth not fully implemented yet)
                 if (Pin != null)
                 {
-                    var expectedHash = NetworkMidi2Protocol.ComputePinHash(Pin);
-                    if (invite.PinHash == null
-                        || !NetworkMidi2Protocol.PinHashesEqual(invite.PinHash, expectedHash))
-                    {
-                        var reason = invite.PinHash == null
-                            ? InvitationRefusedReason.AuthRequired
-                            : InvitationRefusedReason.AuthFailed;
-                        await socket.SendAsync(
-                            NetworkMidi2Protocol.Encode(new InvitationRefusedPacket(invite.InitiatorToken, reason)),
-                            result.RemoteEndPoint, ct);
-                        continue;
-                    }
+                    await socket.SendAsync(
+                        NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.NoMatchingAuthMethod)),
+                        result.RemoteEndPoint, ct);
+                    continue;
                 }
 
-                RemoteName = invite.LocalName;
-                var accepted = new InvitationAcceptedPacket(invite.InitiatorToken, localName);
+                RemoteName = invite.EndpointName;
+                var accepted = new InvitationAcceptedPacket(localName);
                 if (TraceHook != null)
                     TraceHook($"[{localName}] TX InvitationAccepted to {result.RemoteEndPoint}");
                 await socket.SendAsync(
@@ -374,14 +359,15 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 var result = await socket!.ReceiveAsync(ct);
                 if (!NetworkMidi2Protocol.TryParseAll(result.Buffer, out var cmds)) continue;
 
+                // Collect all UMP Data packets in datagram order (oldest FEC history first)
+                var umpPackets = cmds.OfType<UmpDataPacket>().ToList();
+                foreach (var pkt in umpPackets)
+                    HandleUmpDataPacket(pkt);
+
                 foreach (var cmd in cmds)
                 {
                     switch (cmd)
                     {
-                        case UmpDataRawPayload raw:
-                            HandleUmpDataPayload(raw.Bytes);
-                            break;
-
                         case PingPacket ping:
                             if (TraceHook != null)
                                 TraceHook($"[{localName}] RX Ping id={ping.PingId:X8} — replying");
@@ -396,11 +382,11 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
                         case ByePacket bye:
                             if (TraceHook != null)
-                                TraceHook($"[{localName}] RX Bye — sending ByeReply and disconnecting");
+                                TraceHook($"[{localName}] RX Bye reason={bye.Reason} — sending ByeReply and disconnecting");
                             try
                             {
                                 await socket.SendAsync(
-                                    NetworkMidi2Protocol.Encode(new ByeReplyPacket(bye.InitiatorToken)), ct);
+                                    NetworkMidi2Protocol.Encode(new ByeReplyPacket()), ct);
                             }
                             catch { }
                             _ = DisconnectAsync();
@@ -413,52 +399,41 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             }
         }
         catch (OperationCanceledException) { }
-        catch (SocketException)
+        catch (System.Net.Sockets.SocketException)
         {
             if (State == SessionState.Connected)
                 _ = DisconnectAsync();
         }
     }
 
-    private void HandleUmpDataPayload(byte[] payloadBytes)
+    private void HandleUmpDataPacket(UmpDataPacket pkt)
     {
-        if (!UmpDataCommand.TryParsePayload(payloadBytes, out var seqNum, out var fecBlock))
-            return;
-
-        if (!UmpFec.TryDecode(fecBlock, out var primaryWords, out var historical))
-            return;
-
-        // FEC gap recovery
-        if (expectedSeqNum.HasValue && seqNum != expectedSeqNum.Value)
-        {
-            foreach (var h in historical)
-            {
-                if (IsInGap(h.SequenceNumber, expectedSeqNum.Value, seqNum))
-                {
-                    if (TraceHook != null)
-                        TraceHook($"[{localName}] FEC recovered seq={h.SequenceNumber} words={h.UmpWords.Length}");
-                    umpSubject.OnNext(h.UmpWords);
-                }
-            }
-        }
-
-        expectedSeqNum = seqNum + 1;
-
-        if (primaryWords is { Length: > 0 })
+        // Only emit if the sequence number is at or after what we expect
+        // (handles both normal delivery and FEC-recovered historical packets)
+        if (expectedSeqNum.HasValue && !IsSequenceAtOrAfter(pkt.SequenceNumber, expectedSeqNum.Value))
         {
             if (TraceHook != null)
-                TraceHook($"[{localName}] RX UMP seq={seqNum} words={primaryWords.Length}");
-            umpSubject.OnNext(primaryWords);
+                TraceHook($"[{localName}] RX UMP seq={pkt.SequenceNumber} — duplicate/old, skipped");
+            return;
+        }
+
+        expectedSeqNum = (ushort)(pkt.SequenceNumber + 1);
+
+        if (pkt.UmpWords.Length > 0)
+        {
+            if (TraceHook != null)
+                TraceHook($"[{localName}] RX UMP seq={pkt.SequenceNumber} words={pkt.UmpWords.Length}");
+            umpSubject.OnNext(pkt.UmpWords);
         }
     }
 
     /// <summary>
-    /// Returns true if <paramref name="checkpointSeq"/> falls within the gap
-    /// [<paramref name="gapStart"/>, <paramref name="receivedSeq"/> - 1] using
-    /// unsigned 32-bit wraparound arithmetic.
+    /// Returns true if <paramref name="candidate"/> is at or after <paramref name="expected"/>
+    /// in the uint16 sequence number space, using unsigned wraparound arithmetic.
+    /// Assumes the distance is always less than half the range (32768).
     /// </summary>
-    private static bool IsInGap(uint checkpointSeq, uint gapStart, uint receivedSeq)
-        => (checkpointSeq - gapStart) < (receivedSeq - gapStart);
+    private static bool IsSequenceAtOrAfter(ushort candidate, ushort expected)
+        => (ushort)(candidate - expected) < 0x8000;
 
     // -------------------------------------------------------------------------
     // Ping loop

@@ -1,45 +1,63 @@
 namespace Haukcode.NetworkMidi2;
 
 /// <summary>
-/// Codec for the UMP Data Command payload within a Network MIDI 2.0 datagram.
+/// Codec for a single UMP Data command (0xFF) without the datagram magic prefix.
 ///
-/// Wire layout of the UMP Data Command payload (after the 8-byte session header):
-///   4 bytes  SequenceNumber (big-endian uint32)
-///   N bytes  FEC block (see <see cref="UmpFec"/>)
+/// Wire layout:
+///   Byte 0   Command code = 0xFF
+///   Byte 1   Payload length in 32-bit words (uint8)
+///   Byte 2   Sequence number high byte (CSD1)
+///   Byte 3   Sequence number low byte  (CSD2)
+///   N*4      UMP words in big-endian byte order
+///
+/// Used internally by <see cref="UmpFec"/> to build and parse FEC datagrams.
 /// </summary>
-public static class UmpDataCommand
+internal static class UmpDataCommand
 {
-    private const int SequenceNumberSize = 4;
+    internal const byte CommandCode = 0xFF;
+    internal const int HeaderSize   = 4;
 
     /// <summary>
-    /// Encodes the UMP Data Command payload (sequence number + FEC block).
-    /// The returned bytes do NOT include the outer session header — use
-    /// <see cref="NetworkMidi2Protocol.WrapWithHeader"/> to produce a full datagram.
+    /// Encodes a single UMP Data command (header + UMP payload).
+    /// Does NOT include the 4-byte datagram magic.
     /// </summary>
-    public static byte[] EncodePayload(uint sequenceNumber, ReadOnlySpan<byte> fecBlock)
+    public static byte[] Encode(ushort sequenceNumber, ReadOnlySpan<uint> umpWords)
     {
-        var buf = new byte[SequenceNumberSize + fecBlock.Length];
-        BinaryPrimitives.WriteUInt32BigEndian(buf, sequenceNumber);
-        fecBlock.CopyTo(buf.AsSpan(SequenceNumberSize));
+        var buf = new byte[HeaderSize + umpWords.Length * 4];
+        buf[0] = CommandCode;
+        buf[1] = (byte)umpWords.Length;
+        buf[2] = (byte)(sequenceNumber >> 8);  // CSD1 = high byte
+        buf[3] = (byte)(sequenceNumber & 0xFF); // CSD2 = low byte
+        UmpHelpers.WriteWords(umpWords, buf.AsSpan(HeaderSize));
         return buf;
     }
 
     /// <summary>
-    /// Parses the payload portion of a UMP Data Command (after the 8-byte session header).
-    /// Returns the sequence number and the raw FEC block bytes for further decoding.
+    /// Decodes a single UMP Data command from the beginning of <paramref name="data"/>.
+    /// Returns false if the data is truncated or the command code is not 0xFF.
+    /// <paramref name="consumed"/> is set to the total bytes consumed (header + payload).
     /// </summary>
-    public static bool TryParsePayload(
-        ReadOnlySpan<byte> payload,
-        out uint sequenceNumber,
-        out ReadOnlySpan<byte> fecBlock)
+    public static bool TryDecode(
+        ReadOnlySpan<byte> data,
+        out ushort sequenceNumber,
+        out uint[] umpWords,
+        out int consumed)
     {
         sequenceNumber = 0;
-        fecBlock = default;
+        umpWords       = [];
+        consumed       = 0;
 
-        if (payload.Length < SequenceNumberSize) return false;
+        if (data.Length < HeaderSize) return false;
+        if (data[0] != CommandCode) return false;
 
-        sequenceNumber = BinaryPrimitives.ReadUInt32BigEndian(payload);
-        fecBlock = payload[SequenceNumberSize..];
+        int wordCount    = data[1];
+        int payloadBytes = wordCount * 4;
+
+        if (data.Length < HeaderSize + payloadBytes) return false;
+
+        sequenceNumber = (ushort)((data[2] << 8) | data[3]);
+        umpWords       = UmpHelpers.ReadWords(data.Slice(HeaderSize, payloadBytes));
+        consumed       = HeaderSize + payloadBytes;
         return true;
     }
 }

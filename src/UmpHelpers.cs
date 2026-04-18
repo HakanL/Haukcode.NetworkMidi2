@@ -13,14 +13,15 @@ public static class UmpHelpers
     /// </summary>
     public static int GetWordCount(uint firstWord)
     {
-        byte messageType = (byte)(firstWord >> 28);
-        return messageType switch
+        // MTSize[0..15] from M2-104-UM / midi2_wireshark_dissector.lua
+        byte mt = (byte)(firstWord >> 28);
+        return mt switch
         {
-            0x0 or 0x1 or 0x2 or 0x6 or 0x7 => 1,  // 32-bit messages
-            0x3 or 0x4                        => 2,  // 64-bit messages
-            0xD                               => 2,  // 64-bit (Flex Data)
-            0x5 or 0xF                        => 4,  // 128-bit messages
-            _                                => 1,   // unknown — treat as 1
+            0x0 or 0x1 or 0x2 or 0x6 or 0x7 => 1,
+            0x3 or 0x4 or 0x8 or 0x9 or 0xA => 2,
+            0xB or 0xC                       => 3,
+            0x5 or 0xD or 0xE or 0xF         => 4,
+            _                                => 1,
         };
     }
 

@@ -3,53 +3,81 @@ using System.Security.Cryptography;
 namespace Haukcode.NetworkMidi2;
 
 /// <summary>
-/// Network MIDI 2.0 session command types (M2-124-UM v1.0).
+/// Network MIDI 2.0 session command codes (M2-124-UM v1.0).
+/// Each is a single byte in the command header.
 /// </summary>
-public enum NetworkMidi2Command : ushort
+public enum NetworkMidi2Command : byte
 {
-    Invitation          = 0x0001,
-    InvitationAccepted  = 0x0002,
-    InvitationRefused   = 0x0003,
-    Bye                 = 0x0004,
-    ByeReply            = 0x0005,
-    Ping                = 0x0006,
-    PingReply           = 0x0007,
-    UmpData             = 0x0008,
+    Invitation                         = 0x01,
+    InvitationAuthenticate             = 0x02,
+    InvitationUserAuthenticate         = 0x03,
+    InvitationAccepted                 = 0x10,
+    InvitationPending                  = 0x11,
+    InvitationAuthenticationRequired   = 0x12,
+    InvitationUserAuthenticationRequired = 0x13,
+    Ping                               = 0x20,
+    PingReply                          = 0x21,
+    Retransmit                         = 0x80,
+    RetransmitError                    = 0x81,
+    SessionReset                       = 0x82,
+    SessionResetReply                  = 0x83,
+    Nak                                = 0x8F,
+    Bye                                = 0xF0,
+    ByeReply                           = 0xF1,
+    UmpData                            = 0xFF,
 }
 
-/// <summary>Reason codes returned in an InvitationRefused response.</summary>
-public enum InvitationRefusedReason : byte
+/// <summary>
+/// Reason codes for Bye (0xF0) commands (M2-124-UM v1.0 §X, Wireshark dissector).
+/// </summary>
+public enum ByeReason : byte
 {
-    Unspecified  = 0x00,
-    AuthRequired = 0x01,
-    AuthFailed   = 0x02,
-    SessionBusy  = 0x03,
+    Reserved                       = 0x00,
+    UserTerminated                 = 0x01,
+    PowerDown                      = 0x02,
+    TooManyMissingPackets          = 0x03,
+    Timeout                        = 0x04,
+    SessionNotEstablished          = 0x05,
+    NoPendingSession               = 0x06,
+    ProtocolError                  = 0x07,
+    TooManyOpenSessions            = 0x40,
+    AuthMissingPriorInvitation     = 0x41,
+    UserRejected                   = 0x42,
+    AuthFailed                     = 0x43,
+    UserNameNotFound               = 0x44,
+    NoMatchingAuthMethod           = 0x45,
+    InvitationCanceled             = 0x80,
 }
 
 // ---------------------------------------------------------------------------
-// Packet records
+// Packet records — reflect the actual wire fields
 // ---------------------------------------------------------------------------
 
-/// <summary>Invitation (Client → Host): start a session, optionally with PIN auth.</summary>
-public record InvitationPacket(uint InitiatorToken, string LocalName, byte[]? PinHash);
+/// <summary>Invitation (0x01): Client → Host, open session request.</summary>
+/// <param name="EndpointName">UTF-8 name, word-padded on wire.</param>
+/// <param name="ProductInstanceId">ASCII product ID, word-padded on wire.</param>
+public record InvitationPacket(string EndpointName, string ProductInstanceId = "");
 
-/// <summary>InvitationAccepted (Host → Client): session established.</summary>
-public record InvitationAcceptedPacket(uint InitiatorToken, string RemoteName);
+/// <summary>InvitationAccepted (0x10): Host → Client, session established.</summary>
+public record InvitationAcceptedPacket(string EndpointName, string ProductInstanceId = "");
 
-/// <summary>InvitationRefused (Host → Client): session rejected.</summary>
-public record InvitationRefusedPacket(uint InitiatorToken, InvitationRefusedReason Reason);
-
-/// <summary>Bye (either direction): ends the session.</summary>
-public record ByePacket(uint InitiatorToken);
-
-/// <summary>ByeReply: acknowledgment of Bye.</summary>
-public record ByeReplyPacket(uint InitiatorToken);
-
-/// <summary>Ping (liveness check, either direction).</summary>
+/// <summary>Ping (0x20): liveness check, either direction.</summary>
 public record PingPacket(uint PingId);
 
-/// <summary>PingReply: acknowledgment of Ping.</summary>
+/// <summary>PingReply (0x21): acknowledgment of Ping.</summary>
 public record PingReplyPacket(uint PingId);
+
+/// <summary>Bye (0xF0): end the session, with a reason code in CSD1.</summary>
+public record ByePacket(ByeReason Reason);
+
+/// <summary>ByeReply (0xF1): acknowledgment of Bye (no payload).</summary>
+public record ByeReplyPacket;
+
+/// <summary>
+/// A parsed UMP Data command (0xFF).
+/// Multiple of these may appear in one datagram (FEC: oldest first, current last).
+/// </summary>
+internal record UmpDataPacket(ushort SequenceNumber, uint[] UmpWords);
 
 // ---------------------------------------------------------------------------
 // Codec
@@ -59,122 +87,82 @@ public record PingReplyPacket(uint PingId);
 /// Codec for the Network MIDI 2.0 session protocol (M2-124-UM v1.0).
 /// All methods are static and I/O-free.
 ///
-/// Wire format per datagram:
-///   4 bytes  Magic: "MIDI" (0x4D 0x49 0x44 0x49)
-///   2 bytes  Command type (big-endian ushort)
-///   2 bytes  Payload length in bytes (big-endian ushort)
-///   N bytes  Payload
-///
-/// Multiple commands may be packed back-to-back into a single UDP datagram.
+/// Wire format per UDP datagram:
+///   4 bytes  Magic: "MIDI" (0x4D 0x49 0x44 0x49) — exactly once per datagram
+///   Then, one or more commands packed back-to-back:
+///     Byte 0  Command code (byte)
+///     Byte 1  Payload length in 32-bit words (byte)
+///     Byte 2  CSD1 — command-specific data 1
+///     Byte 3  CSD2 — command-specific data 2
+///     N*4     Payload (N = payload-length-in-words)
 /// </summary>
 public static class NetworkMidi2Protocol
 {
     public const int DefaultPort = 5004;
 
     private static ReadOnlySpan<byte> Magic => "MIDI"u8;
-    private const int HeaderSize = 8; // magic(4) + cmd(2) + len(2)
-
-    // Auth type byte values in Invitation payload
-    private const byte AuthTypeNone = 0x00;
-    private const byte AuthTypePin  = 0x01;
+    private const int CommandHeaderSize = 4; // code + payloadWordLen + CSD1 + CSD2
 
     // -------------------------------------------------------------------------
-    // Encode
+    // Encode — each method returns a complete UDP datagram (magic + one command)
     // -------------------------------------------------------------------------
 
     public static byte[] Encode(InvitationPacket packet)
-    {
-        var nameBytes = Encoding.UTF8.GetBytes(packet.LocalName);
-        bool hasPin = packet.PinHash is { Length: 32 };
-
-        // Payload: token(4) + authType(1) + name(N) + NUL(1) [+ pinHash(32)]
-        int payloadLen = 4 + 1 + nameBytes.Length + 1 + (hasPin ? 32 : 0);
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.Invitation, payloadLen);
-
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.InitiatorToken); pos += 4;
-        buf[pos++] = hasPin ? AuthTypePin : AuthTypeNone;
-        nameBytes.CopyTo(buf, pos); pos += nameBytes.Length;
-        buf[pos++] = 0; // NUL terminator
-        if (hasPin)
-            packet.PinHash!.CopyTo(buf, pos);
-
-        return buf;
-    }
+        => EncodeDatagramSingle(NetworkMidi2Command.Invitation,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: 0,
+            EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId));
 
     public static byte[] Encode(InvitationAcceptedPacket packet)
-    {
-        var nameBytes = Encoding.UTF8.GetBytes(packet.RemoteName);
-        // Payload: token(4) + name(N) + NUL(1)
-        int payloadLen = 4 + nameBytes.Length + 1;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.InvitationAccepted, payloadLen);
-
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.InitiatorToken); pos += 4;
-        nameBytes.CopyTo(buf, pos); pos += nameBytes.Length;
-        buf[pos] = 0;
-
-        return buf;
-    }
-
-    public static byte[] Encode(InvitationRefusedPacket packet)
-    {
-        // Payload: token(4) + reason(1)
-        const int payloadLen = 5;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.InvitationRefused, payloadLen);
-
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.InitiatorToken); pos += 4;
-        buf[pos] = (byte)packet.Reason;
-
-        return buf;
-    }
-
-    public static byte[] Encode(ByePacket packet)
-    {
-        const int payloadLen = 4;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.Bye, payloadLen);
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.InitiatorToken);
-        return buf;
-    }
-
-    public static byte[] Encode(ByeReplyPacket packet)
-    {
-        const int payloadLen = 4;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.ByeReply, payloadLen);
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.InitiatorToken);
-        return buf;
-    }
+        => EncodeDatagramSingle(NetworkMidi2Command.InvitationAccepted,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: 0,
+            EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId));
 
     public static byte[] Encode(PingPacket packet)
     {
-        const int payloadLen = 4;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.Ping, payloadLen);
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.PingId);
-        return buf;
+        var payload = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(payload, packet.PingId);
+        return EncodeDatagramSingle(NetworkMidi2Command.Ping, 0, 0, payload);
     }
 
     public static byte[] Encode(PingReplyPacket packet)
     {
-        const int payloadLen = 4;
-        var buf = new byte[HeaderSize + payloadLen];
-        int pos = WriteHeader(buf, NetworkMidi2Command.PingReply, payloadLen);
-        BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(pos), packet.PingId);
-        return buf;
+        var payload = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(payload, packet.PingId);
+        return EncodeDatagramSingle(NetworkMidi2Command.PingReply, 0, 0, payload);
     }
 
+    public static byte[] Encode(ByePacket packet)
+        => EncodeDatagramSingle(NetworkMidi2Command.Bye, csd1: (byte)packet.Reason, csd2: 0, []);
+
+    public static byte[] Encode(ByeReplyPacket _)
+        => EncodeDatagramSingle(NetworkMidi2Command.ByeReply, 0, 0, []);
+
+    // -------------------------------------------------------------------------
+    // Multi-command datagrams
+    // -------------------------------------------------------------------------
+
     /// <summary>
-    /// Prepends the 8-byte session header to an already-encoded payload.
-    /// Used by UmpDataCommand encoding.
+    /// Packs the command bodies from several single-command Encode() results into
+    /// one datagram, with a single magic prefix.  Used for testing and FEC.
+    /// Pass the result of any Encode() overload — the per-datagram magic is stripped
+    /// and the bodies are concatenated under one shared magic.
     /// </summary>
-    internal static byte[] WrapWithHeader(NetworkMidi2Command cmd, ReadOnlySpan<byte> payload)
+    internal static byte[] CombineDatagram(params byte[][] encodedDatagrams)
     {
-        var buf = new byte[HeaderSize + payload.Length];
-        WriteHeader(buf, cmd, payload.Length);
-        payload.CopyTo(buf.AsSpan(HeaderSize));
+        int total = 4; // magic
+        foreach (var d in encodedDatagrams) total += d.Length - 4;
+
+        var buf = new byte[total];
+        Magic.CopyTo(buf);
+        int pos = 4;
+        foreach (var d in encodedDatagrams)
+        {
+            var body = d.AsSpan(4);
+            body.CopyTo(buf.AsSpan(pos));
+            pos += body.Length;
+        }
         return buf;
     }
 
@@ -184,64 +172,39 @@ public static class NetworkMidi2Protocol
 
     /// <summary>
     /// Parses all commands packed into a single UDP datagram.
-    /// Unknown or malformed commands are skipped. Stops at the first truncated header.
-    /// Returns the successfully parsed commands.
+    /// The datagram must begin with the 4-byte "MIDI" magic.
+    /// Returns true only when at least one command was successfully parsed.
+    /// Stops and returns false on bad magic or a truncated command.
     /// </summary>
     public static bool TryParseAll(ReadOnlySpan<byte> datagram, out IReadOnlyList<object> commands)
     {
+        commands = [];
+        if (datagram.Length < 4) return false;
+        if (!datagram[..4].SequenceEqual(Magic)) return false;
+
         var result = new List<object>();
-        int offset = 0;
+        int offset = 4; // skip magic
 
-        while (offset + HeaderSize <= datagram.Length)
+        while (offset + CommandHeaderSize <= datagram.Length)
         {
-            if (!TryParseOne(datagram[offset..], out var cmd, out int consumed))
-                break; // truncated or bad magic — stop
+            byte code           = datagram[offset];
+            byte payloadWords   = datagram[offset + 1];
+            byte csd1           = datagram[offset + 2];
+            byte csd2           = datagram[offset + 3];
+            int  payloadBytes   = payloadWords * 4;
 
-            if (cmd != null)
-                result.Add(cmd);
+            int cmdEnd = offset + CommandHeaderSize + payloadBytes;
+            if (cmdEnd > datagram.Length) return false; // truncated
 
-            offset += consumed;
+            var payload = datagram.Slice(offset + CommandHeaderSize, payloadBytes);
+            var cmd     = ParseCommand((NetworkMidi2Command)code, csd1, csd2, payload);
+            if (cmd != null) result.Add(cmd);
+
+            offset = cmdEnd;
         }
 
         commands = result;
         return result.Count > 0;
-    }
-
-    /// <summary>
-    /// Parses a single command from the start of <paramref name="data"/>.
-    /// Sets <paramref name="consumed"/> to the total bytes consumed (header + payload).
-    /// Returns false only on bad magic or truncation; unknown commands return true with null.
-    /// </summary>
-    public static bool TryParseOne(ReadOnlySpan<byte> data, out object? command, out int consumed)
-    {
-        command = null;
-        consumed = 0;
-
-        if (data.Length < HeaderSize) return false;
-        if (!data[..4].SequenceEqual(Magic)) return false;
-
-        var cmd = (NetworkMidi2Command)BinaryPrimitives.ReadUInt16BigEndian(data[4..]);
-        int payloadLen = BinaryPrimitives.ReadUInt16BigEndian(data[6..]);
-
-        if (data.Length < HeaderSize + payloadLen) return false;
-
-        consumed = HeaderSize + payloadLen;
-        var payload = data.Slice(HeaderSize, payloadLen);
-
-        command = cmd switch
-        {
-            NetworkMidi2Command.Invitation         => ParseInvitation(payload),
-            NetworkMidi2Command.InvitationAccepted => ParseInvitationAccepted(payload),
-            NetworkMidi2Command.InvitationRefused  => ParseInvitationRefused(payload),
-            NetworkMidi2Command.Bye                => ParseTokenOnly(payload, t => new ByePacket(t)),
-            NetworkMidi2Command.ByeReply           => ParseTokenOnly(payload, t => new ByeReplyPacket(t)),
-            NetworkMidi2Command.Ping               => ParseId(payload, id => new PingPacket(id)),
-            NetworkMidi2Command.PingReply          => ParseId(payload, id => new PingReplyPacket(id)),
-            NetworkMidi2Command.UmpData            => new UmpDataRawPayload(payload.ToArray()),
-            _                                      => null, // unknown command, skip
-        };
-
-        return true;
     }
 
     // -------------------------------------------------------------------------
@@ -252,16 +215,13 @@ public static class NetworkMidi2Protocol
     public static byte[] ComputePinHash(string pin)
         => SHA256.HashData(Encoding.UTF8.GetBytes(pin));
 
-    /// <summary>Constant-time comparison of two byte arrays.</summary>
+    /// <summary>Constant-time comparison of two byte spans.</summary>
     public static bool PinHashesEqual(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
         => CryptographicOperations.FixedTimeEquals(a, b);
 
     // -------------------------------------------------------------------------
-    // Token / ID generation
+    // ID generation
     // -------------------------------------------------------------------------
-
-    public static uint GenerateInitiatorToken()
-        => (uint)Random.Shared.NextInt64(1, uint.MaxValue);
 
     public static uint GeneratePingId()
         => (uint)Random.Shared.NextInt64(0, uint.MaxValue);
@@ -270,71 +230,88 @@ public static class NetworkMidi2Protocol
     // Private helpers
     // -------------------------------------------------------------------------
 
-    private static int WriteHeader(byte[] buf, NetworkMidi2Command cmd, int payloadLen)
+    private static int NameWordCount(string name)
+        => (Encoding.UTF8.GetByteCount(name) + 3) / 4;
+
+    private static byte[] EncodeNamePayload(string name, string productId)
     {
-        Magic.CopyTo(buf.AsSpan(0));
-        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(4), (ushort)cmd);
-        BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(6), (ushort)payloadLen);
-        return HeaderSize;
+        var nameBytes    = Encoding.UTF8.GetBytes(name);
+        var productBytes = Encoding.ASCII.GetBytes(productId);
+
+        int nameWords    = (nameBytes.Length + 3) / 4;
+        int productWords = (productBytes.Length + 3) / 4;
+        int totalBytes   = (nameWords + productWords) * 4;
+
+        var buf = new byte[totalBytes]; // zero-initialized → natural null-padding
+        nameBytes.CopyTo(buf, 0);
+        productBytes.CopyTo(buf, nameWords * 4);
+        return buf;
     }
 
-    private static InvitationPacket? ParseInvitation(ReadOnlySpan<byte> payload)
+    private static byte[] EncodeDatagramSingle(
+        NetworkMidi2Command code, byte csd1, byte csd2, byte[] payload)
     {
-        // token(4) + authType(1) + name(N) + NUL(1) [+ pinHash(32)]
-        if (payload.Length < 6) return null;
+        int payloadWords = payload.Length / 4;
+        var buf = new byte[4 + CommandHeaderSize + payload.Length];
+        Magic.CopyTo(buf);
+        buf[4] = (byte)code;
+        buf[5] = (byte)payloadWords;
+        buf[6] = csd1;
+        buf[7] = csd2;
+        payload.CopyTo(buf, 8);
+        return buf;
+    }
 
-        var token    = BinaryPrimitives.ReadUInt32BigEndian(payload);
-        byte authType = payload[4];
-        var nameSpan  = payload[5..];
-
-        int nullIdx = nameSpan.IndexOf((byte)0);
-        if (nullIdx < 0) return null;
-        var name = Encoding.UTF8.GetString(nameSpan[..nullIdx]);
-
-        byte[]? pinHash = null;
-        if (authType == AuthTypePin)
+    private static object? ParseCommand(
+        NetworkMidi2Command code, byte csd1, byte csd2, ReadOnlySpan<byte> payload)
+        => code switch
         {
-            int afterNull = 5 + nullIdx + 1;
-            if (payload.Length >= afterNull + 32)
-                pinHash = payload.Slice(afterNull, 32).ToArray();
-        }
+            NetworkMidi2Command.Invitation         => ParseNamePacket(csd1, payload,
+                (n, p) => new InvitationPacket(n, p)),
+            NetworkMidi2Command.InvitationAccepted => ParseNamePacket(csd1, payload,
+                (n, p) => new InvitationAcceptedPacket(n, p)),
+            NetworkMidi2Command.Ping               => ParsePingId(payload,
+                id => new PingPacket(id)),
+            NetworkMidi2Command.PingReply          => ParsePingId(payload,
+                id => new PingReplyPacket(id)),
+            NetworkMidi2Command.Bye                => new ByePacket((ByeReason)csd1),
+            NetworkMidi2Command.ByeReply           => new ByeReplyPacket(),
+            NetworkMidi2Command.UmpData            => ParseUmpData(csd1, csd2, payload),
+            _                                      => null, // unknown — skip
+        };
 
-        return new InvitationPacket(token, name, pinHash);
-    }
-
-    private static InvitationAcceptedPacket? ParseInvitationAccepted(ReadOnlySpan<byte> payload)
+    private static T? ParseNamePacket<T>(
+        byte nameWordCount, ReadOnlySpan<byte> payload, Func<string, string, T> create)
+        where T : class
     {
-        // token(4) + name(N) + NUL(1)
-        if (payload.Length < 5) return null;
+        int nameBytes = nameWordCount * 4;
+        if (payload.Length < nameBytes) return null;
 
-        var token    = BinaryPrimitives.ReadUInt32BigEndian(payload);
-        var nameSpan = payload[4..];
-        int nullIdx  = nameSpan.IndexOf((byte)0);
-        var name     = Encoding.UTF8.GetString(nullIdx >= 0 ? nameSpan[..nullIdx] : nameSpan);
-
-        return new InvitationAcceptedPacket(token, name);
+        string name = DecodeWordPaddedString(payload[..nameBytes], Encoding.UTF8);
+        string prod = DecodeWordPaddedString(payload[nameBytes..], Encoding.ASCII);
+        return create(name, prod);
     }
 
-    private static InvitationRefusedPacket? ParseInvitationRefused(ReadOnlySpan<byte> payload)
-    {
-        if (payload.Length < 5) return null;
-        var token  = BinaryPrimitives.ReadUInt32BigEndian(payload);
-        var reason = (InvitationRefusedReason)payload[4];
-        return new InvitationRefusedPacket(token, reason);
-    }
-
-    private static T? ParseTokenOnly<T>(ReadOnlySpan<byte> payload, Func<uint, T> create) where T : class
+    private static T? ParsePingId<T>(ReadOnlySpan<byte> payload, Func<uint, T> create)
+        where T : class
     {
         if (payload.Length < 4) return null;
         return create(BinaryPrimitives.ReadUInt32BigEndian(payload));
     }
 
-    private static T? ParseId<T>(ReadOnlySpan<byte> payload, Func<uint, T> create) where T : class
+    private static UmpDataPacket ParseUmpData(byte csd1, byte csd2, ReadOnlySpan<byte> payload)
     {
-        if (payload.Length < 4) return null;
-        return create(BinaryPrimitives.ReadUInt32BigEndian(payload));
+        ushort seqNum   = (ushort)((csd1 << 8) | csd2);
+        uint[] umpWords = UmpHelpers.ReadWords(payload);
+        return new UmpDataPacket(seqNum, umpWords);
+    }
+
+    /// <summary>Decodes a word-padded byte field, stripping trailing null bytes.</summary>
+    private static string DecodeWordPaddedString(ReadOnlySpan<byte> data, Encoding enc)
+    {
+        // Trim trailing null padding
+        int len = data.Length;
+        while (len > 0 && data[len - 1] == 0) len--;
+        return enc.GetString(data[..len]);
     }
 }
-
-/// <summary>Raw UMP data payload bytes before FEC decode. Internal use only.</summary>
-internal sealed record UmpDataRawPayload(byte[] Bytes);

@@ -5,105 +5,89 @@ namespace NetworkMidi2.Tests;
 public class NetworkMidi2ProtocolTests
 {
     // -------------------------------------------------------------------------
-    // Invitation
+    // Wire format constants
+    // -------------------------------------------------------------------------
+
+    private static ReadOnlySpan<byte> MidiMagic => [0x4D, 0x49, 0x44, 0x49]; // "MIDI"
+
+    // -------------------------------------------------------------------------
+    // Invitation (0x01)
     // -------------------------------------------------------------------------
 
     [Fact]
-    public void Invitation_RoundTrip_NoPin()
+    public void Invitation_RoundTrip_BasicName()
     {
-        var original = new InvitationPacket(0xDEADBEEF, "Test Session", PinHash: null);
-        var encoded = NetworkMidi2Protocol.Encode(original);
+        var original = new InvitationPacket("Test Session");
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        // Verify magic at position 0
+        Assert.Equal(MidiMagic.ToArray(), encoded[..4]);
+        // Verify command code byte
+        Assert.Equal(0x01, encoded[4]);
 
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         var parsed = Assert.IsType<InvitationPacket>(cmds[0]);
 
-        Assert.Equal(0xDEADBEEFu, parsed.InitiatorToken);
-        Assert.Equal("Test Session", parsed.LocalName);
-        Assert.Null(parsed.PinHash);
+        Assert.Equal("Test Session", parsed.EndpointName);
+        Assert.Equal("", parsed.ProductInstanceId);
     }
 
     [Fact]
-    public void Invitation_RoundTrip_WithPin()
+    public void Invitation_RoundTrip_WithProductId()
     {
-        var pinHash  = NetworkMidi2Protocol.ComputePinHash("secret");
-        var original = new InvitationPacket(0x12345678, "Secure Session", pinHash);
+        var original = new InvitationPacket("My Device", "SN-12345");
         var encoded  = NetworkMidi2Protocol.Encode(original);
 
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         var parsed = Assert.IsType<InvitationPacket>(cmds[0]);
 
-        Assert.Equal("Secure Session", parsed.LocalName);
-        Assert.NotNull(parsed.PinHash);
-        Assert.Equal(32, parsed.PinHash.Length);
-        Assert.True(NetworkMidi2Protocol.PinHashesEqual(parsed.PinHash, pinHash));
+        Assert.Equal("My Device", parsed.EndpointName);
+        Assert.Equal("SN-12345", parsed.ProductInstanceId);
+    }
+
+    [Fact]
+    public void Invitation_NameWordCount_InCSD1()
+    {
+        // "ABCD" = 4 bytes = 1 word → CSD1 = 1
+        var encoded = NetworkMidi2Protocol.Encode(new InvitationPacket("ABCD"));
+        Assert.Equal(1, encoded[6]); // CSD1
+
+        // "ABCDE" = 5 bytes → ceil(5/4) = 2 words → CSD1 = 2
+        var encoded2 = NetworkMidi2Protocol.Encode(new InvitationPacket("ABCDE"));
+        Assert.Equal(2, encoded2[6]);
+    }
+
+    [Fact]
+    public void Invitation_PayloadLength_IsWordCount()
+    {
+        var encoded = NetworkMidi2Protocol.Encode(new InvitationPacket("Hi"));
+        // PayloadLengthWords is at encoded[5]
+        int payloadWords = encoded[5];
+        // actual payload = (total - magic:4 - header:4)
+        int actualPayloadBytes = encoded.Length - 8;
+        Assert.Equal(payloadWords * 4, actualPayloadBytes);
     }
 
     // -------------------------------------------------------------------------
-    // InvitationAccepted
+    // InvitationAccepted (0x10)
     // -------------------------------------------------------------------------
 
     [Fact]
     public void InvitationAccepted_RoundTrip()
     {
-        var original = new InvitationAcceptedPacket(0xABCD1234, "Bridge");
+        var original = new InvitationAcceptedPacket("Bridge");
         var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x10, encoded[4]); // command code
 
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         var parsed = Assert.IsType<InvitationAcceptedPacket>(cmds[0]);
 
-        Assert.Equal(0xABCD1234u, parsed.InitiatorToken);
-        Assert.Equal("Bridge", parsed.RemoteName);
+        Assert.Equal("Bridge", parsed.EndpointName);
     }
 
     // -------------------------------------------------------------------------
-    // InvitationRefused
-    // -------------------------------------------------------------------------
-
-    [Theory]
-    [InlineData(InvitationRefusedReason.Unspecified)]
-    [InlineData(InvitationRefusedReason.AuthRequired)]
-    [InlineData(InvitationRefusedReason.AuthFailed)]
-    [InlineData(InvitationRefusedReason.SessionBusy)]
-    public void InvitationRefused_RoundTrip_AllReasons(InvitationRefusedReason reason)
-    {
-        var original = new InvitationRefusedPacket(0x99887766, reason);
-        var encoded  = NetworkMidi2Protocol.Encode(original);
-
-        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
-        var parsed = Assert.IsType<InvitationRefusedPacket>(cmds[0]);
-
-        Assert.Equal(0x99887766u, parsed.InitiatorToken);
-        Assert.Equal(reason, parsed.Reason);
-    }
-
-    // -------------------------------------------------------------------------
-    // Bye / ByeReply
-    // -------------------------------------------------------------------------
-
-    [Fact]
-    public void Bye_RoundTrip()
-    {
-        var original = new ByePacket(0x11223344);
-        var encoded  = NetworkMidi2Protocol.Encode(original);
-
-        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
-        var parsed = Assert.IsType<ByePacket>(cmds[0]);
-        Assert.Equal(0x11223344u, parsed.InitiatorToken);
-    }
-
-    [Fact]
-    public void ByeReply_RoundTrip()
-    {
-        var original = new ByeReplyPacket(0xAABBCCDD);
-        var encoded  = NetworkMidi2Protocol.Encode(original);
-
-        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
-        var parsed = Assert.IsType<ByeReplyPacket>(cmds[0]);
-        Assert.Equal(0xAABBCCDDu, parsed.InitiatorToken);
-    }
-
-    // -------------------------------------------------------------------------
-    // Ping / PingReply
+    // Ping (0x20) / PingReply (0x21)
     // -------------------------------------------------------------------------
 
     [Fact]
@@ -111,6 +95,17 @@ public class NetworkMidi2ProtocolTests
     {
         var original = new PingPacket(0xFEDCBA98);
         var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x20, encoded[4]);  // code
+        Assert.Equal(1,    encoded[5]);  // payloadWordLen = 1
+        Assert.Equal(0,    encoded[6]);  // CSD1 = 0
+        Assert.Equal(0,    encoded[7]);  // CSD2 = 0
+
+        // PingId at bytes 8-11 big-endian
+        Assert.Equal(0xFE, encoded[8]);
+        Assert.Equal(0xDC, encoded[9]);
+        Assert.Equal(0xBA, encoded[10]);
+        Assert.Equal(0x98, encoded[11]);
 
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         var parsed = Assert.IsType<PingPacket>(cmds[0]);
@@ -123,9 +118,48 @@ public class NetworkMidi2ProtocolTests
         var original = new PingReplyPacket(0x00112233);
         var encoded  = NetworkMidi2Protocol.Encode(original);
 
+        Assert.Equal(0x21, encoded[4]);
+
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         var parsed = Assert.IsType<PingReplyPacket>(cmds[0]);
         Assert.Equal(0x00112233u, parsed.PingId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bye (0xF0) / ByeReply (0xF1)
+    // -------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(ByeReason.UserTerminated)]
+    [InlineData(ByeReason.PowerDown)]
+    [InlineData(ByeReason.Timeout)]
+    [InlineData(ByeReason.TooManyOpenSessions)]
+    [InlineData(ByeReason.AuthFailed)]
+    public void Bye_RoundTrip_AllReasons(ByeReason reason)
+    {
+        var original = new ByePacket(reason);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0xF0, encoded[4]);     // code
+        Assert.Equal(0,    encoded[5]);     // payloadWordLen = 0 (no payload)
+        Assert.Equal((byte)reason, encoded[6]); // CSD1 = reason
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<ByePacket>(cmds[0]);
+        Assert.Equal(reason, parsed.Reason);
+    }
+
+    [Fact]
+    public void ByeReply_RoundTrip()
+    {
+        var original = new ByeReplyPacket();
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0xF1, encoded[4]);
+        Assert.Equal(0,    encoded[5]); // no payload
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        Assert.IsType<ByeReplyPacket>(cmds[0]);
     }
 
     // -------------------------------------------------------------------------
@@ -135,11 +169,11 @@ public class NetworkMidi2ProtocolTests
     [Fact]
     public void MultipleCommandsInOneDatagram_AllParsed()
     {
-        var ping    = NetworkMidi2Protocol.Encode(new PingPacket(0x11111111));
-        var bye     = NetworkMidi2Protocol.Encode(new ByePacket(0x22222222));
-        var pingRep = NetworkMidi2Protocol.Encode(new PingReplyPacket(0x33333333));
-
-        var combined = ping.Concat(bye).Concat(pingRep).ToArray();
+        // CombineDatagram packs multiple command bodies under one "MIDI" magic
+        var combined = NetworkMidi2Protocol.CombineDatagram(
+            NetworkMidi2Protocol.Encode(new PingPacket(0x11111111)),
+            NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.UserTerminated)),
+            NetworkMidi2Protocol.Encode(new PingReplyPacket(0x33333333)));
 
         Assert.True(NetworkMidi2Protocol.TryParseAll(combined, out var cmds));
         Assert.Equal(3, cmds.Count);
@@ -150,43 +184,85 @@ public class NetworkMidi2ProtocolTests
     }
 
     // -------------------------------------------------------------------------
+    // UMP Data (0xFF) — parsed by TryParseAll
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void UmpData_ParsedByTryParseAll()
+    {
+        // Build a minimal UMP Data datagram manually:
+        // [magic:4][0xFF][wordCount=1][seqHi=0x00][seqLo=0x05][ump_word:4]
+        byte[] datagram =
+        [
+            0x4D, 0x49, 0x44, 0x49,  // "MIDI" magic
+            0xFF,                     // code = UMP Data
+            0x01,                     // payloadWordLen = 1
+            0x00,                     // CSD1 = seqNum high byte = 0
+            0x05,                     // CSD2 = seqNum low byte  = 5  → seqNum = 5
+            0x20, 0x90, 0x60, 0x40,  // UMP word (MIDI1 Note-On)
+        ];
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(datagram, out var cmds));
+        // UmpDataPacket is internal; cast via pattern matching
+        Assert.Single(cmds);
+        // The object type name validates it decoded correctly
+        Assert.Equal("UmpDataPacket", cmds[0].GetType().Name);
+    }
+
+    [Fact]
+    public void UmpData_SequenceNumber_ReadFromCSD()
+    {
+        // seqNum = 0x1234 → CSD1=0x12, CSD2=0x34
+        byte[] datagram =
+        [
+            0x4D, 0x49, 0x44, 0x49,
+            0xFF,
+            0x01,    // 1 word payload
+            0x12,    // CSD1 = high byte
+            0x34,    // CSD2 = low byte  → seqNum = 0x1234
+            0x20, 0x00, 0x00, 0x00,
+        ];
+
+        // Parse via UmpDataCommand directly
+        Assert.True(UmpDataCommand.TryDecode(datagram[4..], out ushort seqNum, out _, out _));
+        Assert.Equal((ushort)0x1234, seqNum);
+    }
+
+    // -------------------------------------------------------------------------
     // Parse rejection
     // -------------------------------------------------------------------------
 
     [Fact]
     public void Parse_RejectsWrongMagic()
     {
-        var buf = new byte[12];
-        buf[0] = 0x00; // not 'M'
-        buf[1] = 0x49;
-        buf[2] = 0x44;
-        buf[3] = 0x49;
+        byte[] buf = [0x00, 0x49, 0x44, 0x49, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
         Assert.False(NetworkMidi2Protocol.TryParseAll(buf, out _));
     }
 
     [Fact]
     public void Parse_RejectsTooShort()
     {
-        var buf = new byte[] { 0x4D, 0x49, 0x44 }; // "MID" — truncated magic
+        byte[] buf = [0x4D, 0x49, 0x44]; // truncated magic
         Assert.False(NetworkMidi2Protocol.TryParseAll(buf, out _));
     }
 
     [Fact]
-    public void Parse_TruncatedPayload_ReturnsFalseForThatCommand()
+    public void Parse_TruncatedPayload_ReturnsFalse()
     {
-        // Valid header for a Ping (payload should be 4 bytes) but only 2 payload bytes provided
-        var buf = new byte[]
-        {
-            0x4D, 0x49, 0x44, 0x49,  // "MIDI"
-            0x00, 0x06,               // Ping command
-            0x00, 0x04,               // declares 4-byte payload
-            0x00, 0x01,               // only 2 bytes of payload
-        };
+        // Declares 1-word (4-byte) payload but only provides 2 bytes
+        byte[] buf =
+        [
+            0x4D, 0x49, 0x44, 0x49,  // magic
+            0x20,                     // Ping
+            0x01,                     // payloadWordLen = 1 (expects 4 bytes)
+            0x00, 0x00,               // CSD1, CSD2
+            0x00, 0x01,               // only 2 bytes of payload (truncated)
+        ];
         Assert.False(NetworkMidi2Protocol.TryParseAll(buf, out _));
     }
 
     // -------------------------------------------------------------------------
-    // PIN hash
+    // PIN hash helpers
     // -------------------------------------------------------------------------
 
     [Fact]

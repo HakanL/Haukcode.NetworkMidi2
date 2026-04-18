@@ -5,7 +5,7 @@ namespace NetworkMidi2.Tests;
 public class UmpHelpersTests
 {
     // -------------------------------------------------------------------------
-    // GetWordCount
+    // GetWordCount — complete MTSize[0..15] table from M2-104-UM
     // -------------------------------------------------------------------------
 
     [Theory]
@@ -14,28 +14,41 @@ public class UmpHelpersTests
     [InlineData(0x2, 1)]
     [InlineData(0x6, 1)]
     [InlineData(0x7, 1)]
-    public void GetWordCount_32BitTypes_Returns1(byte msgType, int expected)
+    public void GetWordCount_32BitTypes_Returns1(byte mt, int expected)
     {
-        uint word = (uint)msgType << 28;
+        uint word = (uint)mt << 28;
         Assert.Equal(expected, UmpHelpers.GetWordCount(word));
     }
 
     [Theory]
     [InlineData(0x3, 2)]
     [InlineData(0x4, 2)]
-    [InlineData(0xD, 2)]
-    public void GetWordCount_64BitTypes_Returns2(byte msgType, int expected)
+    [InlineData(0x8, 2)]
+    [InlineData(0x9, 2)]
+    [InlineData(0xA, 2)]
+    public void GetWordCount_64BitTypes_Returns2(byte mt, int expected)
     {
-        uint word = (uint)msgType << 28;
+        uint word = (uint)mt << 28;
+        Assert.Equal(expected, UmpHelpers.GetWordCount(word));
+    }
+
+    [Theory]
+    [InlineData(0xB, 3)]
+    [InlineData(0xC, 3)]
+    public void GetWordCount_96BitTypes_Returns3(byte mt, int expected)
+    {
+        uint word = (uint)mt << 28;
         Assert.Equal(expected, UmpHelpers.GetWordCount(word));
     }
 
     [Theory]
     [InlineData(0x5, 4)]
+    [InlineData(0xD, 4)]
+    [InlineData(0xE, 4)]
     [InlineData(0xF, 4)]
-    public void GetWordCount_128BitTypes_Returns4(byte msgType, int expected)
+    public void GetWordCount_128BitTypes_Returns4(byte mt, int expected)
     {
-        uint word = (uint)msgType << 28;
+        uint word = (uint)mt << 28;
         Assert.Equal(expected, UmpHelpers.GetWordCount(word));
     }
 
@@ -46,7 +59,7 @@ public class UmpHelpersTests
     [Fact]
     public void ReadWords_BigEndian_Correct()
     {
-        byte[] bytes = [0x12, 0x34, 0x56, 0x78,  0xAB, 0xCD, 0xEF, 0x00];
+        byte[] bytes = [0x12, 0x34, 0x56, 0x78, 0xAB, 0xCD, 0xEF, 0x00];
         var words = UmpHelpers.ReadWords(bytes);
 
         Assert.Equal(2, words.Length);
@@ -75,7 +88,7 @@ public class UmpHelpersTests
     public void ReadWrite_RoundTrip()
     {
         uint[] original = [0xDEADBEEF, 0x12345678, 0x00000000, 0xFFFFFFFF];
-        var bytes = UmpHelpers.ToBytes(original);
+        var bytes   = UmpHelpers.ToBytes(original);
         var decoded = UmpHelpers.ReadWords(bytes);
         Assert.Equal(original, decoded);
     }
@@ -94,28 +107,35 @@ public class UmpHelpersTests
     [Fact]
     public void IsWellFormed_SingleType2Word_ReturnsTrue()
     {
-        uint[] words = [0x20000000u]; // type 2, 1 word
+        uint[] words = [0x20000000u];
         Assert.True(UmpHelpers.IsWellFormed(words));
     }
 
     [Fact]
     public void IsWellFormed_Type4TwoWords_ReturnsTrue()
     {
-        uint[] words = [0x40000000u, 0x00000000u]; // type 4, 2 words
+        uint[] words = [0x40000000u, 0x00000000u];
         Assert.True(UmpHelpers.IsWellFormed(words));
     }
 
     [Fact]
     public void IsWellFormed_Type5FourWords_ReturnsTrue()
     {
-        uint[] words = [0x50000000u, 0x00000000u, 0x00000000u, 0x00000000u]; // type 5, 4 words
+        uint[] words = [0x50000000u, 0x00000000u, 0x00000000u, 0x00000000u];
+        Assert.True(UmpHelpers.IsWellFormed(words));
+    }
+
+    [Fact]
+    public void IsWellFormed_TypeDFourWords_ReturnsTrue()
+    {
+        // MT=0xD requires 4 words (flex data, updated from previous wrong table)
+        uint[] words = [0xD0000000u, 0x00000000u, 0x00000000u, 0x00000000u];
         Assert.True(UmpHelpers.IsWellFormed(words));
     }
 
     [Fact]
     public void IsWellFormed_Type4OneWord_ReturnsFalse()
     {
-        // type 4 needs 2 words but only 1 given
         uint[] words = [0x40000000u];
         Assert.False(UmpHelpers.IsWellFormed(words));
     }
@@ -125,8 +145,8 @@ public class UmpHelpersTests
     {
         uint[] words =
         [
-            0x20000000u,  // type 2 (1 word)
-            0x40000000u, 0x00000000u,  // type 4 (2 words)
+            0x20000000u,              // MT=2, 1 word
+            0x40000000u, 0x00000000u, // MT=4, 2 words
         ];
         Assert.True(UmpHelpers.IsWellFormed(words));
     }
