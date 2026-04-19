@@ -490,4 +490,146 @@ public class NetworkMidi2ProtocolTests
         Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
         Assert.IsType<SessionResetReplyPacket>(cmds[0]);
     }
+
+    // -------------------------------------------------------------------------
+    // InvitationUserAuthenticationRequired (0x13)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InvitationUserAuthenticationRequired_RoundTrip()
+    {
+        var nonce    = new byte[16];
+        for (int i = 0; i < 16; i++) nonce[i] = (byte)(i + 1);
+
+        var original = new InvitationUserAuthenticationRequiredPacket(nonce, "Host", "ID-001", AuthState: 0);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x13, encoded[4]); // command code
+        Assert.Equal(0,    encoded[7]); // CSD2 = auth state 0
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationUserAuthenticationRequiredPacket>(cmds[0]);
+
+        Assert.Equal(nonce, parsed.Nonce);
+        Assert.Equal("Host", parsed.EndpointName);
+        Assert.Equal("ID-001", parsed.ProductInstanceId);
+        Assert.Equal(0, parsed.AuthState);
+    }
+
+    [Fact]
+    public void InvitationUserAuthenticationRequired_AuthState1_RoundTrip()
+    {
+        var nonce    = new byte[16];
+        var original = new InvitationUserAuthenticationRequiredPacket(nonce, "Host", "", AuthState: 1);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(1, encoded[7]); // CSD2 = auth state 1
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationUserAuthenticationRequiredPacket>(cmds[0]);
+        Assert.Equal(1, parsed.AuthState);
+    }
+
+    // -------------------------------------------------------------------------
+    // InvitationUserAuthenticate (0x03)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InvitationUserAuthenticate_RoundTrip()
+    {
+        var digest = new byte[32];
+        for (int i = 0; i < 32; i++) digest[i] = (byte)(i + 0xA0);
+
+        var original = new InvitationUserAuthenticatePacket(digest, "Client", "SN-99", "alice");
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x03, encoded[4]); // command code
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationUserAuthenticatePacket>(cmds[0]);
+
+        Assert.Equal(digest, parsed.AuthDigest);
+        Assert.Equal("Client", parsed.EndpointName);
+        Assert.Equal("SN-99", parsed.ProductInstanceId);
+        Assert.Equal("alice", parsed.UserName);
+    }
+
+    [Fact]
+    public void InvitationUserAuthenticate_EmptyUsername_RoundTrip()
+    {
+        var digest = new byte[32];
+        var original = new InvitationUserAuthenticatePacket(digest, "Client", "", "");
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x03, encoded[4]);
+        // CSD2 = username word count — empty username = 0
+        Assert.Equal(0, encoded[7]);
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationUserAuthenticatePacket>(cmds[0]);
+        Assert.Equal("", parsed.UserName);
+    }
+
+    [Fact]
+    public void InvitationUserAuthenticate_UsernameWordCountInCSD2()
+    {
+        var digest = new byte[32];
+        // "ABCD" = 4 bytes = 1 word → CSD2 should be 1
+        var original = new InvitationUserAuthenticatePacket(digest, "E", "", "ABCD");
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(1, encoded[7]); // CSD2 = username word count
+    }
+
+    // -------------------------------------------------------------------------
+    // User auth digest helper — ComputeUserAuthDigest
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ComputeUserAuthDigest_Returns32Bytes()
+    {
+        var nonce  = new byte[16];
+        var digest = NetworkMidi2Protocol.ComputeUserAuthDigest("password", nonce);
+        Assert.Equal(32, digest.Length);
+    }
+
+    [Fact]
+    public void ComputeUserAuthDigest_SameInputs_SameOutput()
+    {
+        var nonce = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        var d1 = NetworkMidi2Protocol.ComputeUserAuthDigest("s3cr3t", nonce);
+        var d2 = NetworkMidi2Protocol.ComputeUserAuthDigest("s3cr3t", nonce);
+        Assert.Equal(d1, d2);
+    }
+
+    [Fact]
+    public void ComputeUserAuthDigest_DifferentPassword_DifferentOutput()
+    {
+        var nonce = new byte[16];
+        var d1 = NetworkMidi2Protocol.ComputeUserAuthDigest("pass1", nonce);
+        var d2 = NetworkMidi2Protocol.ComputeUserAuthDigest("pass2", nonce);
+        Assert.False(d1.SequenceEqual(d2));
+    }
+
+    [Fact]
+    public void ComputeUserAuthDigest_DifferentNonce_DifferentOutput()
+    {
+        var nonce1 = new byte[16];
+        var nonce2 = new byte[16];
+        nonce2[0] = 1;
+        var d1 = NetworkMidi2Protocol.ComputeUserAuthDigest("password", nonce1);
+        var d2 = NetworkMidi2Protocol.ComputeUserAuthDigest("password", nonce2);
+        Assert.False(d1.SequenceEqual(d2));
+    }
+
+    [Fact]
+    public void ComputeUserAuthDigest_SameAsPinDigest()
+    {
+        // Both ComputeAuthDigest and ComputeUserAuthDigest use SHA-256(credential) as the HMAC key
+        // and the nonce as the data, so they produce identical output for the same inputs.
+        var nonce      = new byte[16];
+        var pinDigest  = NetworkMidi2Protocol.ComputeAuthDigest("same", nonce);
+        var userDigest = NetworkMidi2Protocol.ComputeUserAuthDigest("same", nonce);
+        Assert.Equal(pinDigest, userDigest);
+    }
 }

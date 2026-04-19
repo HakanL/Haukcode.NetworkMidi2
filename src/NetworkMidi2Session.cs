@@ -68,6 +68,8 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     public IObservable<SessionState> StateChanges        => stateSubject.AsObservable();
     public string? RemoteName { get; private set; }
     public string? Pin { get; set; }
+    public string? Username { get; set; }
+    public string? Password { get; set; }
 
     public SessionState State
     {
@@ -340,6 +342,27 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                             continue;
                         }
 
+                        if (cmd is InvitationUserAuthenticationRequiredPacket userAuthRequired)
+                        {
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX InvitationUserAuthenticationRequired authState={userAuthRequired.AuthState}");
+
+                            if (Username == null || Password == null)
+                            {
+                                throw new InvalidOperationException(
+                                    "Host requires user authentication but no Username/Password is set.");
+                            }
+
+                            var digest     = NetworkMidi2Protocol.ComputeUserAuthDigest(Password, userAuthRequired.Nonce);
+                            var authPacket = new InvitationUserAuthenticatePacket(digest, localName, "", Username);
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] TX InvitationUserAuthenticate user='{Username}'");
+                            await socket.SendAsync(
+                                NetworkMidi2Protocol.Encode(authPacket), ct);
+                            // Continue waiting for InvitationAccepted or Bye
+                            continue;
+                        }
+
                         if (cmd is ByePacket bye)
                         {
                             throw new InvalidOperationException(
@@ -364,9 +387,13 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     private async Task<IPEndPoint> AcceptAsHostAsync(CancellationToken ct)
     {
-        // Tracks pending auth: maps client endpoint → (nonce we sent, retryCount)
+        // Tracks pending PIN auth: maps client endpoint → nonce we sent
         var pendingAuth   = new Dictionary<string, byte[]>();
         var pendingRetry  = new HashSet<string>();
+
+        // Tracks pending user auth: maps client endpoint → nonce we sent
+        var pendingUserAuth  = new Dictionary<string, byte[]>();
+        var pendingUserRetry = new HashSet<string>();
 
         while (true)
         {
@@ -381,6 +408,23 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 {
                     if (TraceHook != null)
                         TraceHook($"[{localName}] RX Invitation from {result.RemoteEndPoint} name='{invite.EndpointName}'");
+
+                    if (Username != null && Password != null)
+                    {
+                        // Generate a nonce and challenge the client with user auth
+                        var nonce = RandomNumberGenerator.GetBytes(16);
+                        pendingUserAuth[clientKey] = nonce;
+                        pendingUserRetry.Remove(clientKey);
+
+                        var challenge = new InvitationUserAuthenticationRequiredPacket(
+                            nonce, localName, "", AuthState: 0);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationUserAuthenticationRequired to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(challenge),
+                            result.RemoteEndPoint, ct);
+                        continue;
+                    }
 
                     if (Pin != null)
                     {
@@ -456,6 +500,73 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         // Second failure — reject
                         pendingAuth.Remove(clientKey);
                         pendingRetry.Remove(clientKey);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX Bye (AuthFailed) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.AuthFailed)),
+                            result.RemoteEndPoint, ct);
+                    }
+                }
+
+                if (cmd is InvitationUserAuthenticatePacket userAuthResponse && Username != null && Password != null)
+                {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] RX InvitationUserAuthenticate from {result.RemoteEndPoint} user='{userAuthResponse.UserName}'");
+
+                    if (!pendingUserAuth.TryGetValue(clientKey, out var storedNonce))
+                    {
+                        // No pending user auth for this client — ignore
+                        continue;
+                    }
+
+                    if (userAuthResponse.UserName != Username)
+                    {
+                        // Unknown username — reject immediately
+                        pendingUserAuth.Remove(clientKey);
+                        pendingUserRetry.Remove(clientKey);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX Bye (UserNameNotFound) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.UserNameNotFound)),
+                            result.RemoteEndPoint, ct);
+                        continue;
+                    }
+
+                    var expectedDigest = NetworkMidi2Protocol.ComputeUserAuthDigest(Password, storedNonce);
+                    if (NetworkMidi2Protocol.PinHashesEqual(userAuthResponse.AuthDigest, expectedDigest))
+                    {
+                        pendingUserAuth.Remove(clientKey);
+                        pendingUserRetry.Remove(clientKey);
+                        RemoteName = userAuthResponse.EndpointName;
+                        var accepted = new InvitationAcceptedPacket(localName);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationAccepted (user auth OK) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(accepted),
+                            result.RemoteEndPoint, ct);
+
+                        return (IPEndPoint)result.RemoteEndPoint;
+                    }
+                    else if (!pendingUserRetry.Contains(clientKey))
+                    {
+                        // Wrong password — allow one retry with a new nonce
+                        var nonce = RandomNumberGenerator.GetBytes(16);
+                        pendingUserAuth[clientKey] = nonce;
+                        pendingUserRetry.Add(clientKey);
+
+                        var challenge = new InvitationUserAuthenticationRequiredPacket(
+                            nonce, localName, "", AuthState: 1);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationUserAuthenticationRequired (retry) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(challenge),
+                            result.RemoteEndPoint, ct);
+                    }
+                    else
+                    {
+                        // Second failure — reject
+                        pendingUserAuth.Remove(clientKey);
+                        pendingUserRetry.Remove(clientKey);
                         if (TraceHook != null)
                             TraceHook($"[{localName}] TX Bye (AuthFailed) to {result.RemoteEndPoint}");
                         await socket.SendAsync(

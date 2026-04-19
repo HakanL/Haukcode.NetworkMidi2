@@ -14,6 +14,7 @@ Enables bidirectional MIDI 2.0 (UMP) over IP — send and receive Universal MIDI
 - Full M2-124-UM v1.0 session protocol (Invitation / InvitationAccepted / Ping / Bye)
 - Both **client** and **host** roles, with optional auto-reconnect
 - **PIN authentication** — full challenge-response handshake (HMAC-SHA-256, `InvitationAuthenticate` / `InvitationAuthenticationRequired`)
+- **User authentication** — username/password challenge-response handshake (HMAC-SHA-256, `InvitationUserAuthenticate` / `InvitationUserAuthenticationRequired`)
 - **Invitation pending** — host can signal "try again later" (`InvitationPending`)
 - **NAK** — generic negative acknowledgment with reason code
 - **Retransmit / RetransmitError** — explicit missing-packet recovery request
@@ -152,8 +153,10 @@ The default port is **5004**.
 | 2a | — | Replies `InvitationAccepted` (open session, no PIN) |
 | 2b | — | Replies `InvitationPending` (busy; client retries) |
 | 2c | — | Replies `InvitationAuthenticationRequired` (PIN required, with nonce) |
+| 2d | — | Replies `InvitationUserAuthenticationRequired` (username/password required, with nonce) |
 | 3 | Sends `InvitationAuthenticate` (HMAC-SHA-256 digest) | — |
-| 4 | — | Replies `InvitationAccepted` (PIN verified) or `Bye` (`AuthFailed`) |
+| 3u | Sends `InvitationUserAuthenticate` (username + HMAC-SHA-256 digest) | — |
+| 4 | — | Replies `InvitationAccepted` (PIN/user verified) or `Bye` (`AuthFailed` / `UserNameNotFound`) |
 | 5 | Session established — both sides exchange `UmpData` (0xFF) | ← same |
 | 6 | Periodic `Ping` / `PingReply` to detect liveness | ← same |
 | 7 | Either side sends `Bye` to end the session | — |
@@ -174,11 +177,7 @@ Wire layout (single datagram):
 
 ### Known gaps vs. the M2-124-UM v1.0 specification
 
-The following command is defined in the specification but not yet implemented:
-
-| Feature | Command code(s) | Notes |
-|---------|----------------|-------|
-| User authentication | `InvitationUserAuthenticate` (0x03), `InvitationUserAuthenticationRequired` (0x13) | Username/password flow; `Pin`-based device auth (0x02/0x12) is fully implemented |
+All session commands defined in the specification are now implemented.
 
 ---
 
