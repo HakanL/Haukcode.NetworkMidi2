@@ -287,4 +287,207 @@ public class NetworkMidi2ProtocolTests
         var h2 = NetworkMidi2Protocol.ComputePinHash("xyz");
         Assert.False(NetworkMidi2Protocol.PinHashesEqual(h1, h2));
     }
+
+    // -------------------------------------------------------------------------
+    // InvitationPending (0x11)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InvitationPending_RoundTrip()
+    {
+        var encoded = NetworkMidi2Protocol.Encode(new InvitationPendingPacket());
+
+        Assert.Equal(0x11, encoded[4]); // command code
+        Assert.Equal(0,    encoded[5]); // no payload
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        Assert.IsType<InvitationPendingPacket>(cmds[0]);
+    }
+
+    // -------------------------------------------------------------------------
+    // InvitationAuthenticationRequired (0x12)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InvitationAuthenticationRequired_RoundTrip()
+    {
+        var nonce    = new byte[16];
+        for (int i = 0; i < 16; i++) nonce[i] = (byte)(i + 1);
+
+        var original = new InvitationAuthenticationRequiredPacket(nonce, "Host", "ID-001", AuthState: 0);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x12, encoded[4]); // command code
+        Assert.Equal(0,    encoded[7]); // CSD2 = auth state 0
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationAuthenticationRequiredPacket>(cmds[0]);
+
+        Assert.Equal(nonce, parsed.Nonce);
+        Assert.Equal("Host", parsed.EndpointName);
+        Assert.Equal("ID-001", parsed.ProductInstanceId);
+        Assert.Equal(0, parsed.AuthState);
+    }
+
+    [Fact]
+    public void InvitationAuthenticationRequired_AuthState1_RoundTrip()
+    {
+        var nonce   = new byte[16];
+        var original = new InvitationAuthenticationRequiredPacket(nonce, "Host", "", AuthState: 1);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(1, encoded[7]); // CSD2 = auth state 1
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationAuthenticationRequiredPacket>(cmds[0]);
+        Assert.Equal(1, parsed.AuthState);
+    }
+
+    // -------------------------------------------------------------------------
+    // InvitationAuthenticate (0x02)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InvitationAuthenticate_RoundTrip()
+    {
+        var digest   = new byte[32];
+        for (int i = 0; i < 32; i++) digest[i] = (byte)(i + 0xA0);
+
+        var original = new InvitationAuthenticatePacket(digest, "Client", "SN-99");
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x02, encoded[4]); // command code
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<InvitationAuthenticatePacket>(cmds[0]);
+
+        Assert.Equal(digest, parsed.AuthDigest);
+        Assert.Equal("Client", parsed.EndpointName);
+        Assert.Equal("SN-99", parsed.ProductInstanceId);
+    }
+
+    // -------------------------------------------------------------------------
+    // PIN authentication helpers — ComputeAuthDigest
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ComputeAuthDigest_Returns32Bytes()
+    {
+        var nonce = new byte[16];
+        var digest = NetworkMidi2Protocol.ComputeAuthDigest("secret", nonce);
+        Assert.Equal(32, digest.Length);
+    }
+
+    [Fact]
+    public void ComputeAuthDigest_SameInputs_SameOutput()
+    {
+        var nonce = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        var d1 = NetworkMidi2Protocol.ComputeAuthDigest("pin1234", nonce);
+        var d2 = NetworkMidi2Protocol.ComputeAuthDigest("pin1234", nonce);
+        Assert.Equal(d1, d2);
+    }
+
+    [Fact]
+    public void ComputeAuthDigest_DifferentNonce_DifferentOutput()
+    {
+        var nonce1 = new byte[16];
+        var nonce2 = new byte[16];
+        nonce2[0] = 1;
+        var d1 = NetworkMidi2Protocol.ComputeAuthDigest("pin", nonce1);
+        var d2 = NetworkMidi2Protocol.ComputeAuthDigest("pin", nonce2);
+        Assert.False(d1.SequenceEqual(d2));
+    }
+
+    // -------------------------------------------------------------------------
+    // Nak (0x8F)
+    // -------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(NakReason.CommandNotSupported)]
+    [InlineData(NakReason.CommandNotExpected)]
+    [InlineData(NakReason.CommandMalformed)]
+    [InlineData(NakReason.BadPingReply)]
+    public void Nak_RoundTrip_AllReasons(NakReason reason)
+    {
+        var encoded = NetworkMidi2Protocol.Encode(new NakPacket(reason));
+
+        Assert.Equal(0x8F, encoded[4]);           // command code
+        Assert.Equal(0,    encoded[5]);           // payloadWordLen = 0
+        Assert.Equal((byte)reason, encoded[6]);   // CSD1 = reason
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<NakPacket>(cmds[0]);
+        Assert.Equal(reason, parsed.Reason);
+    }
+
+    // -------------------------------------------------------------------------
+    // Retransmit (0x80) / RetransmitError (0x81)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Retransmit_RoundTrip_TwoSequenceNumbers()
+    {
+        var original = new RetransmitPacket([0x0005, 0x0006]);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x80, encoded[4]); // command code
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<RetransmitPacket>(cmds[0]);
+        Assert.Equal<ushort>([0x0005, 0x0006], parsed.SequenceNumbers);
+    }
+
+    [Fact]
+    public void Retransmit_RoundTrip_SingleSequenceNumber()
+    {
+        var original = new RetransmitPacket([0x1234]);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<RetransmitPacket>(cmds[0]);
+        // One seq packed in one word → two 16-bit slots; first = 0x1234, second = 0x0000
+        Assert.True(parsed.SequenceNumbers.Length >= 1);
+        Assert.Equal((ushort)0x1234, parsed.SequenceNumbers[0]);
+    }
+
+    [Fact]
+    public void RetransmitError_RoundTrip()
+    {
+        var original = new RetransmitErrorPacket([0xABCD, 0x1234]);
+        var encoded  = NetworkMidi2Protocol.Encode(original);
+
+        Assert.Equal(0x81, encoded[4]); // command code
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        var parsed = Assert.IsType<RetransmitErrorPacket>(cmds[0]);
+        Assert.Equal<ushort>([0xABCD, 0x1234], parsed.SequenceNumbers);
+    }
+
+    // -------------------------------------------------------------------------
+    // SessionReset (0x82) / SessionResetReply (0x83)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void SessionReset_RoundTrip()
+    {
+        var encoded = NetworkMidi2Protocol.Encode(new SessionResetPacket());
+
+        Assert.Equal(0x82, encoded[4]);
+        Assert.Equal(0,    encoded[5]); // no payload
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        Assert.IsType<SessionResetPacket>(cmds[0]);
+    }
+
+    [Fact]
+    public void SessionResetReply_RoundTrip()
+    {
+        var encoded = NetworkMidi2Protocol.Encode(new SessionResetReplyPacket());
+
+        Assert.Equal(0x83, encoded[4]);
+        Assert.Equal(0,    encoded[5]); // no payload
+
+        Assert.True(NetworkMidi2Protocol.TryParseAll(encoded, out var cmds));
+        Assert.IsType<SessionResetReplyPacket>(cmds[0]);
+    }
 }

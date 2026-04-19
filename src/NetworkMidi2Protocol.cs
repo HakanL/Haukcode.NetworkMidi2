@@ -28,6 +28,17 @@ public enum NetworkMidi2Command : byte
 }
 
 /// <summary>
+/// Reason codes for Nak (0x8F) commands (M2-124-UM v1.0).
+/// </summary>
+public enum NakReason : byte
+{
+    CommandNotSupported = 0x01,
+    CommandNotExpected  = 0x02,
+    CommandMalformed    = 0x03,
+    BadPingReply        = 0x20,
+}
+
+/// <summary>
 /// Reason codes for Bye (0xF0) commands (M2-124-UM v1.0 §X, Wireshark dissector).
 /// </summary>
 public enum ByeReason : byte
@@ -72,6 +83,57 @@ public record ByePacket(ByeReason Reason);
 
 /// <summary>ByeReply (0xF1): acknowledgment of Bye (no payload).</summary>
 public record ByeReplyPacket;
+
+/// <summary>
+/// InvitationPending (0x11): Host → Client — session is busy; client should retry later.
+/// No payload.
+/// </summary>
+public record InvitationPendingPacket;
+
+/// <summary>
+/// InvitationAuthenticationRequired (0x12): Host → Client — PIN authentication required.
+/// CSD1 = endpoint-name word count, CSD2 = auth state (0 = first request, 1 = retry).
+/// Payload = 16-byte nonce | endpoint name (word-padded) | product ID (word-padded).
+/// </summary>
+public record InvitationAuthenticationRequiredPacket(
+    byte[] Nonce,
+    string EndpointName,
+    string ProductInstanceId,
+    byte AuthState);
+
+/// <summary>
+/// InvitationAuthenticate (0x02): Client → Host — challenge response for PIN auth.
+/// CSD1 = endpoint-name word count, CSD2 = 0.
+/// Payload = 32-byte HMAC-SHA-256 digest | endpoint name (word-padded) | product ID (word-padded).
+/// </summary>
+public record InvitationAuthenticatePacket(
+    byte[] AuthDigest,
+    string EndpointName,
+    string ProductInstanceId);
+
+/// <summary>Nak (0x8F): generic negative acknowledgment. CSD1 = reason code.</summary>
+public record NakPacket(NakReason Reason);
+
+/// <summary>
+/// Retransmit (0x80): receiver → sender — explicit request to resend missing packets.
+/// Payload = pairs of 16-bit sequence numbers (big-endian, packed two per 32-bit word).
+/// </summary>
+public record RetransmitPacket(ushort[] SequenceNumbers);
+
+/// <summary>
+/// RetransmitError (0x81): sender → receiver — requested packets are unavailable.
+/// Payload = pairs of 16-bit sequence numbers (big-endian, packed two per 32-bit word).
+/// </summary>
+public record RetransmitErrorPacket(ushort[] SequenceNumbers);
+
+/// <summary>
+/// SessionReset (0x82): either side → other side — reset mid-session sequence counters.
+/// No payload.
+/// </summary>
+public record SessionResetPacket;
+
+/// <summary>SessionResetReply (0x83): acknowledgment of SessionReset. No payload.</summary>
+public record SessionResetReplyPacket;
 
 /// <summary>
 /// A parsed UMP Data command (0xFF).
@@ -138,6 +200,58 @@ public static class NetworkMidi2Protocol
 
     public static byte[] Encode(ByeReplyPacket _)
         => EncodeDatagramSingle(NetworkMidi2Command.ByeReply, 0, 0, []);
+
+    public static byte[] Encode(InvitationPendingPacket _)
+        => EncodeDatagramSingle(NetworkMidi2Command.InvitationPending, 0, 0, []);
+
+    public static byte[] Encode(InvitationAuthenticationRequiredPacket packet)
+    {
+        if (packet.Nonce.Length != 16)
+            throw new ArgumentException("Nonce must be exactly 16 bytes.", nameof(packet));
+
+        var namePayload = EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId);
+        var payload     = new byte[16 + namePayload.Length];
+        packet.Nonce.CopyTo(payload, 0);
+        namePayload.CopyTo(payload, 16);
+
+        return EncodeDatagramSingle(
+            NetworkMidi2Command.InvitationAuthenticationRequired,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: packet.AuthState,
+            payload);
+    }
+
+    public static byte[] Encode(InvitationAuthenticatePacket packet)
+    {
+        if (packet.AuthDigest.Length != 32)
+            throw new ArgumentException("AuthDigest must be exactly 32 bytes.", nameof(packet));
+
+        var namePayload = EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId);
+        var payload     = new byte[32 + namePayload.Length];
+        packet.AuthDigest.CopyTo(payload, 0);
+        namePayload.CopyTo(payload, 32);
+
+        return EncodeDatagramSingle(
+            NetworkMidi2Command.InvitationAuthenticate,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: 0,
+            payload);
+    }
+
+    public static byte[] Encode(NakPacket packet)
+        => EncodeDatagramSingle(NetworkMidi2Command.Nak, csd1: (byte)packet.Reason, csd2: 0, []);
+
+    public static byte[] Encode(RetransmitPacket packet)
+        => EncodeDatagramSingle(NetworkMidi2Command.Retransmit, 0, 0, EncodeSequenceNumbers(packet.SequenceNumbers));
+
+    public static byte[] Encode(RetransmitErrorPacket packet)
+        => EncodeDatagramSingle(NetworkMidi2Command.RetransmitError, 0, 0, EncodeSequenceNumbers(packet.SequenceNumbers));
+
+    public static byte[] Encode(SessionResetPacket _)
+        => EncodeDatagramSingle(NetworkMidi2Command.SessionReset, 0, 0, []);
+
+    public static byte[] Encode(SessionResetReplyPacket _)
+        => EncodeDatagramSingle(NetworkMidi2Command.SessionResetReply, 0, 0, []);
 
     // -------------------------------------------------------------------------
     // Multi-command datagrams
@@ -215,6 +329,16 @@ public static class NetworkMidi2Protocol
     public static byte[] ComputePinHash(string pin)
         => SHA256.HashData(Encoding.UTF8.GetBytes(pin));
 
+    /// <summary>
+    /// Computes the challenge-response digest for PIN authentication.
+    /// Returns HMAC-SHA-256 with the PIN hash as key and the 16-byte nonce as data.
+    /// </summary>
+    public static byte[] ComputeAuthDigest(string pin, ReadOnlySpan<byte> nonce)
+    {
+        var key = ComputePinHash(pin);
+        return HMACSHA256.HashData(key, nonce);
+    }
+
     /// <summary>Constant-time comparison of two byte spans.</summary>
     public static bool PinHashesEqual(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
         => CryptographicOperations.FixedTimeEquals(a, b);
@@ -268,12 +392,20 @@ public static class NetworkMidi2Protocol
         {
             NetworkMidi2Command.Invitation         => ParseNamePacket(csd1, payload,
                 (n, p) => new InvitationPacket(n, p)),
+            NetworkMidi2Command.InvitationAuthenticate => ParseAuthenticatePacket(csd1, payload),
             NetworkMidi2Command.InvitationAccepted => ParseNamePacket(csd1, payload,
                 (n, p) => new InvitationAcceptedPacket(n, p)),
+            NetworkMidi2Command.InvitationPending  => new InvitationPendingPacket(),
+            NetworkMidi2Command.InvitationAuthenticationRequired => ParseAuthRequiredPacket(csd1, csd2, payload),
             NetworkMidi2Command.Ping               => ParsePingId(payload,
                 id => new PingPacket(id)),
             NetworkMidi2Command.PingReply          => ParsePingId(payload,
                 id => new PingReplyPacket(id)),
+            NetworkMidi2Command.Retransmit         => new RetransmitPacket(ParseSequenceNumbers(payload)),
+            NetworkMidi2Command.RetransmitError    => new RetransmitErrorPacket(ParseSequenceNumbers(payload)),
+            NetworkMidi2Command.SessionReset       => new SessionResetPacket(),
+            NetworkMidi2Command.SessionResetReply  => new SessionResetReplyPacket(),
+            NetworkMidi2Command.Nak                => new NakPacket((NakReason)csd1),
             NetworkMidi2Command.Bye                => new ByePacket((ByeReason)csd1),
             NetworkMidi2Command.ByeReply           => new ByeReplyPacket(),
             NetworkMidi2Command.UmpData            => ParseUmpData(csd1, csd2, payload),
@@ -313,5 +445,61 @@ public static class NetworkMidi2Protocol
         int len = data.Length;
         while (len > 0 && data[len - 1] == 0) len--;
         return enc.GetString(data[..len]);
+    }
+
+    private static InvitationAuthenticatePacket? ParseAuthenticatePacket(
+        byte nameWordCount, ReadOnlySpan<byte> payload)
+    {
+        // Payload = [32-byte digest][name (word-padded)][product ID]
+        if (payload.Length < 32) return null;
+        var digest = payload[..32].ToArray();
+        int nameBytes = nameWordCount * 4;
+        if (payload.Length < 32 + nameBytes) return null;
+        string name = DecodeWordPaddedString(payload.Slice(32, nameBytes), Encoding.UTF8);
+        string prod = DecodeWordPaddedString(payload[(32 + nameBytes)..], Encoding.ASCII);
+        return new InvitationAuthenticatePacket(digest, name, prod);
+    }
+
+    private static InvitationAuthenticationRequiredPacket? ParseAuthRequiredPacket(
+        byte nameWordCount, byte authState, ReadOnlySpan<byte> payload)
+    {
+        // Payload = [16-byte nonce][name (word-padded)][product ID]
+        if (payload.Length < 16) return null;
+        var nonce = payload[..16].ToArray();
+        int nameBytes = nameWordCount * 4;
+        if (payload.Length < 16 + nameBytes) return null;
+        string name = DecodeWordPaddedString(payload.Slice(16, nameBytes), Encoding.UTF8);
+        string prod = DecodeWordPaddedString(payload[(16 + nameBytes)..], Encoding.ASCII);
+        return new InvitationAuthenticationRequiredPacket(nonce, name, prod, authState);
+    }
+
+    /// <summary>
+    /// Encodes a list of 16-bit sequence numbers into a byte array,
+    /// packing two numbers per 32-bit word, big-endian.
+    /// </summary>
+    private static byte[] EncodeSequenceNumbers(ushort[] seqNums)
+    {
+        // Round up to even count (pad with 0 if needed), then pack 2 per word
+        int words = (seqNums.Length + 1) / 2;
+        var buf   = new byte[words * 4];
+        for (int i = 0; i < seqNums.Length; i++)
+        {
+            int byteOffset = i * 2;
+            buf[byteOffset]     = (byte)(seqNums[i] >> 8);
+            buf[byteOffset + 1] = (byte)(seqNums[i] & 0xFF);
+        }
+        return buf;
+    }
+
+    /// <summary>
+    /// Parses a list of 16-bit sequence numbers packed two per 32-bit word (big-endian).
+    /// </summary>
+    private static ushort[] ParseSequenceNumbers(ReadOnlySpan<byte> payload)
+    {
+        int count = payload.Length / 2;
+        var result = new ushort[count];
+        for (int i = 0; i < count; i++)
+            result[i] = (ushort)((payload[i * 2] << 8) | payload[i * 2 + 1]);
+        return result;
     }
 }
