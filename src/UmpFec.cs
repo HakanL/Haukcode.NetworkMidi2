@@ -37,6 +37,27 @@ internal static class UmpFec
         /// <summary>Returns history entries oldest-first, at most <see cref="MaxHistory"/> entries.</summary>
         public IReadOnlyList<(ushort SeqNum, uint[] UmpWords)> GetHistory()
             => queue.Select(e => (e.SequenceNumber, e.Words)).ToList();
+
+        /// <summary>
+        /// Tries to find a recorded entry by sequence number.
+        /// Returns true and sets <paramref name="umpWords"/> if found; false otherwise.
+        /// </summary>
+        public bool TryGet(ushort sequenceNumber, out uint[] umpWords)
+        {
+            foreach (var entry in queue)
+            {
+                if (entry.SequenceNumber == sequenceNumber)
+                {
+                    umpWords = entry.Words;
+                    return true;
+                }
+            }
+            umpWords = [];
+            return false;
+        }
+
+        /// <summary>Clears all recorded history entries.</summary>
+        public void Clear() => queue.Clear();
     }
 
     // -------------------------------------------------------------------------

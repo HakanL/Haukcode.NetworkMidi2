@@ -13,6 +13,11 @@ Enables bidirectional MIDI 2.0 (UMP) over IP — send and receive Universal MIDI
 
 - Full M2-124-UM v1.0 session protocol (Invitation / InvitationAccepted / Ping / Bye)
 - Both **client** and **host** roles, with optional auto-reconnect
+- **PIN authentication** — full challenge-response handshake (HMAC-SHA-256, `InvitationAuthenticate` / `InvitationAuthenticationRequired`)
+- **Invitation pending** — host can signal "try again later" (`InvitationPending`)
+- **NAK** — generic negative acknowledgment with reason code
+- **Retransmit / RetransmitError** — explicit missing-packet recovery request
+- **Session reset** — mid-session sequence counter reset without disconnect (`SessionReset` / `SessionResetReply`)
 - Universal MIDI Packet (UMP) encoding/decoding — all message types
 - Forward Error Correction (FEC) — up to 2 historical UMP payloads piggy-backed on every outbound datagram
 - `IObservable<T>` streams via **System.Reactive** for received UMP and state changes
@@ -144,11 +149,15 @@ The default port is **5004**.
 | Step | Initiator (client) | Responder (host) |
 |------|--------------------|-----------------|
 | 1 | Sends `Invitation` | — |
-| 2 | — | Replies `InvitationAccepted` (or `Bye` to reject) |
-| 3 | Session established — both sides exchange `UmpData` (0xFF) | ← same |
-| 4 | Periodic `Ping` / `PingReply` to detect liveness | ← same |
-| 5 | Either side sends `Bye` to end the session | — |
-| 6 | — | Replies `ByeReply` |
+| 2a | — | Replies `InvitationAccepted` (open session, no PIN) |
+| 2b | — | Replies `InvitationPending` (busy; client retries) |
+| 2c | — | Replies `InvitationAuthenticationRequired` (PIN required, with nonce) |
+| 3 | Sends `InvitationAuthenticate` (HMAC-SHA-256 digest) | — |
+| 4 | — | Replies `InvitationAccepted` (PIN verified) or `Bye` (`AuthFailed`) |
+| 5 | Session established — both sides exchange `UmpData` (0xFF) | ← same |
+| 6 | Periodic `Ping` / `PingReply` to detect liveness | ← same |
+| 7 | Either side sends `Bye` to end the session | — |
+| 8 | — | Replies `ByeReply` |
 
 ### UMP Data and Forward Error Correction (FEC)
 
@@ -165,17 +174,11 @@ Wire layout (single datagram):
 
 ### Known gaps vs. the M2-124-UM v1.0 specification
 
-The following features are defined in the specification but not yet implemented:
+The following command is defined in the specification but not yet implemented:
 
 | Feature | Command code(s) | Notes |
 |---------|----------------|-------|
-| PIN authentication | `InvitationAuthenticate` (0x02), `InvitationUserAuthenticate` (0x03), `InvitationAuthenticationRequired` (0x12), `InvitationUserAuthenticationRequired` (0x13) | Framework scaffolded (`Pin` property), full handshake flow not yet wired |
-| Invitation pending | `InvitationPending` (0x11) | Host can signal "try again later" |
-| Explicit retransmit request | `Retransmit` (0x80), `RetransmitError` (0x81) | Client can request specific missing sequence numbers; library currently recovers via FEC only |
-| Session reset | `SessionReset` (0x82), `SessionResetReply` (0x83) | Mid-session reset without full disconnect |
-| NAK | `Nak` (0x8F) | Generic negative acknowledgment |
-
-These commands are present in the `NetworkMidi2Command` enum and will be decoded when received (the codec returns `null` for unrecognised commands, so unknown command bytes are silently skipped rather than causing errors).
+| User authentication | `InvitationUserAuthenticate` (0x03), `InvitationUserAuthenticationRequired` (0x13) | Username/password flow; `Pin`-based device auth (0x02/0x12) is fully implemented |
 
 ---
 

@@ -30,6 +30,12 @@ public interface INetworkMidi2Session : IAsyncDisposable
     Task DisconnectAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Send a SessionReset command to the remote peer and reset local sequence tracking.
+    /// Both sides restart their sequence counters without closing the session.
+    /// </summary>
+    Task SendSessionResetAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Send UMP words to the remote peer.
     /// Words must be in host byte order; the codec writes them big-endian on the wire.
     /// </summary>

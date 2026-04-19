@@ -1,5 +1,6 @@
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
+using System.Security.Cryptography;
 
 namespace Haukcode.NetworkMidi2;
 
@@ -189,6 +190,26 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     }
 
     // -------------------------------------------------------------------------
+    // SendSessionResetAsync
+    // -------------------------------------------------------------------------
+
+    public async Task SendSessionResetAsync(CancellationToken ct = default)
+    {
+        if (State != SessionState.Connected)
+            throw new InvalidOperationException("Not connected.");
+
+        if (TraceHook != null)
+            TraceHook($"[{localName}] TX SessionReset to {remoteEndPoint}");
+
+        await socket!.SendAsync(
+            NetworkMidi2Protocol.Encode(new SessionResetPacket()), ct);
+
+        ResetSequenceTracking();
+        outboundSeqNum = (ushort)Random.Shared.Next(0, ushort.MaxValue + 1);
+        fecHistory.Clear();
+    }
+
+    // -------------------------------------------------------------------------
     // Reconnect loops
     // -------------------------------------------------------------------------
 
@@ -289,6 +310,36 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                             return;
                         }
 
+                        if (cmd is InvitationPendingPacket)
+                        {
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX InvitationPending — host is busy, will retry");
+                            // Break inner loop to trigger outer retry with delay
+                            await Task.Delay(500, ct);
+                            goto nextAttempt;
+                        }
+
+                        if (cmd is InvitationAuthenticationRequiredPacket authRequired)
+                        {
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX InvitationAuthenticationRequired authState={authRequired.AuthState}");
+
+                            if (Pin == null)
+                            {
+                                throw new InvalidOperationException(
+                                    "Host requires PIN authentication but no Pin is set.");
+                            }
+
+                            var digest     = NetworkMidi2Protocol.ComputeAuthDigest(Pin, authRequired.Nonce);
+                            var authPacket = new InvitationAuthenticatePacket(digest, localName, "");
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] TX InvitationAuthenticate");
+                            await socket.SendAsync(
+                                NetworkMidi2Protocol.Encode(authPacket), ct);
+                            // Continue waiting for InvitationAccepted or Bye
+                            continue;
+                        }
+
                         if (cmd is ByePacket bye)
                         {
                             throw new InvalidOperationException(
@@ -301,6 +352,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             {
                 // Inner 1 s retry expired — try again
             }
+            nextAttempt:;
         }
 
         throw new TimeoutException($"Network MIDI 2.0 handshake timed out for {remoteEndPoint}.");
@@ -312,36 +364,104 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     private async Task<IPEndPoint> AcceptAsHostAsync(CancellationToken ct)
     {
+        // Tracks pending auth: maps client endpoint → nonce we sent
+        var pendingAuth = new Dictionary<string, byte[]>();
+
         while (true)
         {
             var result = await socket!.ReceiveAsync(ct);
             if (!NetworkMidi2Protocol.TryParseAll(result.Buffer, out var cmds)) continue;
 
+            var clientKey = result.RemoteEndPoint.ToString();
+
             foreach (var cmd in cmds)
             {
-                if (cmd is not InvitationPacket invite) continue;
-
-                if (TraceHook != null)
-                    TraceHook($"[{localName}] RX Invitation from {result.RemoteEndPoint} name='{invite.EndpointName}'");
-
-                // Reject if PIN is required (auth not fully implemented yet)
-                if (Pin != null)
+                if (cmd is InvitationPacket invite)
                 {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] RX Invitation from {result.RemoteEndPoint} name='{invite.EndpointName}'");
+
+                    if (Pin != null)
+                    {
+                        // Generate a nonce and challenge the client
+                        var nonce = RandomNumberGenerator.GetBytes(16);
+                        pendingAuth[clientKey] = nonce;
+
+                        var challenge = new InvitationAuthenticationRequiredPacket(
+                            nonce, localName, "", AuthState: 0);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationAuthenticationRequired to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(challenge),
+                            result.RemoteEndPoint, ct);
+                        continue;
+                    }
+
+                    RemoteName = invite.EndpointName;
+                    var accepted = new InvitationAcceptedPacket(localName);
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] TX InvitationAccepted to {result.RemoteEndPoint}");
                     await socket.SendAsync(
-                        NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.NoMatchingAuthMethod)),
+                        NetworkMidi2Protocol.Encode(accepted),
                         result.RemoteEndPoint, ct);
-                    continue;
+
+                    return (IPEndPoint)result.RemoteEndPoint;
                 }
 
-                RemoteName = invite.EndpointName;
-                var accepted = new InvitationAcceptedPacket(localName);
-                if (TraceHook != null)
-                    TraceHook($"[{localName}] TX InvitationAccepted to {result.RemoteEndPoint}");
-                await socket.SendAsync(
-                    NetworkMidi2Protocol.Encode(accepted),
-                    result.RemoteEndPoint, ct);
+                if (cmd is InvitationAuthenticatePacket authResponse && Pin != null)
+                {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] RX InvitationAuthenticate from {result.RemoteEndPoint}");
 
-                return (IPEndPoint)result.RemoteEndPoint;
+                    if (!pendingAuth.TryGetValue(clientKey, out var storedNonce))
+                    {
+                        // No pending auth for this client — ignore
+                        continue;
+                    }
+
+                    var expectedDigest = NetworkMidi2Protocol.ComputeAuthDigest(Pin, storedNonce);
+                    if (NetworkMidi2Protocol.PinHashesEqual(authResponse.AuthDigest, expectedDigest))
+                    {
+                        pendingAuth.Remove(clientKey);
+                        RemoteName = authResponse.EndpointName;
+                        var accepted = new InvitationAcceptedPacket(localName);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationAccepted (PIN OK) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(accepted),
+                            result.RemoteEndPoint, ct);
+
+                        return (IPEndPoint)result.RemoteEndPoint;
+                    }
+                    else
+                    {
+                        // Wrong PIN — retry once with a new nonce then reject
+                        var nonce = RandomNumberGenerator.GetBytes(16);
+                        var authState = (byte)(pendingAuth.ContainsKey(clientKey + "_retry") ? 1 : 0);
+                        if (authState == 0)
+                        {
+                            pendingAuth[clientKey] = nonce;
+                            pendingAuth[clientKey + "_retry"] = [];
+                            var challenge = new InvitationAuthenticationRequiredPacket(
+                                nonce, localName, "", AuthState: 1);
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] TX InvitationAuthenticationRequired (retry) to {result.RemoteEndPoint}");
+                            await socket.SendAsync(
+                                NetworkMidi2Protocol.Encode(challenge),
+                                result.RemoteEndPoint, ct);
+                        }
+                        else
+                        {
+                            pendingAuth.Remove(clientKey);
+                            pendingAuth.Remove(clientKey + "_retry");
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] TX Bye (AuthFailed) to {result.RemoteEndPoint}");
+                            await socket.SendAsync(
+                                NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.AuthFailed)),
+                                result.RemoteEndPoint, ct);
+                        }
+                    }
+                }
             }
         }
     }
@@ -380,6 +500,33 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                                 TraceHook($"[{localName}] RX PingReply id={pingReply.PingId:X8}");
                             break;
 
+                        case NakPacket nak:
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX Nak reason={nak.Reason}");
+                            break;
+
+                        case RetransmitPacket retransmit:
+                            await HandleRetransmitAsync(retransmit, ct);
+                            break;
+
+                        case RetransmitErrorPacket retransmitError:
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX RetransmitError seqs=[{string.Join(",", retransmitError.SequenceNumbers)}]");
+                            break;
+
+                        case SessionResetPacket:
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX SessionReset — resetting sequence tracking");
+                            ResetSequenceTracking();
+                            await socket.SendAsync(
+                                NetworkMidi2Protocol.Encode(new SessionResetReplyPacket()), ct);
+                            break;
+
+                        case SessionResetReplyPacket:
+                            if (TraceHook != null)
+                                TraceHook($"[{localName}] RX SessionResetReply");
+                            break;
+
                         case ByePacket bye:
                             if (TraceHook != null)
                                 TraceHook($"[{localName}] RX Bye reason={bye.Reason} — sending ByeReply and disconnecting");
@@ -406,6 +553,38 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         }
     }
 
+    private async Task HandleRetransmitAsync(RetransmitPacket retransmit, CancellationToken ct)
+    {
+        if (TraceHook != null)
+            TraceHook($"[{localName}] RX Retransmit seqs=[{string.Join(",", retransmit.SequenceNumbers)}]");
+
+        var unavailable = new List<ushort>();
+
+        foreach (var seqNum in retransmit.SequenceNumbers)
+        {
+            if (fecHistory.TryGet(seqNum, out var umpWords))
+            {
+                // Resend the requested sequence as a plain UMP datagram (no extra FEC)
+                var datagram = UmpFec.EncodeDatagram(seqNum, umpWords, []);
+                if (TraceHook != null)
+                    TraceHook($"[{localName}] TX Retransmit seq={seqNum}");
+                await socket!.SendAsync(datagram, ct);
+            }
+            else
+            {
+                unavailable.Add(seqNum);
+            }
+        }
+
+        if (unavailable.Count > 0)
+        {
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX RetransmitError seqs=[{string.Join(",", unavailable)}]");
+            await socket!.SendAsync(
+                NetworkMidi2Protocol.Encode(new RetransmitErrorPacket([.. unavailable])), ct);
+        }
+    }
+
     private void HandleUmpDataPacket(UmpDataPacket pkt)
     {
         // Only emit if the sequence number is at or after what we expect
@@ -425,6 +604,11 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 TraceHook($"[{localName}] RX UMP seq={pkt.SequenceNumber} words={pkt.UmpWords.Length}");
             umpSubject.OnNext(pkt.UmpWords);
         }
+    }
+
+    private void ResetSequenceTracking()
+    {
+        expectedSeqNum = null;
     }
 
     /// <summary>
