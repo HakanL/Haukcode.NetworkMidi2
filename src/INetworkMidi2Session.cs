@@ -62,4 +62,19 @@ public interface INetworkMidi2Session : IAsyncDisposable
     /// When set on a host, incoming invitations must include the matching hash.
     /// </summary>
     string? Pin { get; set; }
+
+    /// <summary>
+    /// Optional username for user authentication.
+    /// Must be set together with <see cref="Password"/> to enable user authentication.
+    /// On the client side this username is sent in the <c>InvitationUserAuthenticate</c> packet.
+    /// On the host side the username is checked against the one supplied by the client.
+    /// </summary>
+    string? Username { get; set; }
+
+    /// <summary>
+    /// Optional password for user authentication.
+    /// Must be set together with <see cref="Username"/> to enable user authentication.
+    /// The password is never sent on the wire; only the HMAC-SHA-256 digest (password hash × nonce) is transmitted.
+    /// </summary>
+    string? Password { get; set; }
 }

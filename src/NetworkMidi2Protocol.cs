@@ -111,6 +111,28 @@ public record InvitationAuthenticatePacket(
     string EndpointName,
     string ProductInstanceId);
 
+/// <summary>
+/// InvitationUserAuthenticationRequired (0x13): Host → Client — user (username/password) authentication required.
+/// CSD1 = endpoint-name word count, CSD2 = auth state (0 = first request, 1 = retry).
+/// Payload = 16-byte nonce | endpoint name (word-padded) | product ID (word-padded).
+/// </summary>
+public record InvitationUserAuthenticationRequiredPacket(
+    byte[] Nonce,
+    string EndpointName,
+    string ProductInstanceId,
+    byte AuthState);
+
+/// <summary>
+/// InvitationUserAuthenticate (0x03): Client → Host — challenge response for user auth.
+/// CSD1 = endpoint-name word count, CSD2 = username word count.
+/// Payload = 32-byte HMAC-SHA-256 digest | endpoint name (word-padded) | product ID (word-padded) | username (word-padded).
+/// </summary>
+public record InvitationUserAuthenticatePacket(
+    byte[] AuthDigest,
+    string EndpointName,
+    string ProductInstanceId,
+    string UserName);
+
 /// <summary>Nak (0x8F): generic negative acknowledgment. CSD1 = reason code.</summary>
 public record NakPacket(NakReason Reason);
 
@@ -238,6 +260,46 @@ public static class NetworkMidi2Protocol
             payload);
     }
 
+    public static byte[] Encode(InvitationUserAuthenticationRequiredPacket packet)
+    {
+        if (packet.Nonce.Length != 16)
+            throw new ArgumentException("Nonce must be exactly 16 bytes.", nameof(packet));
+
+        var namePayload = EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId);
+        var payload     = new byte[16 + namePayload.Length];
+        packet.Nonce.CopyTo(payload, 0);
+        namePayload.CopyTo(payload, 16);
+
+        return EncodeDatagramSingle(
+            NetworkMidi2Command.InvitationUserAuthenticationRequired,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: packet.AuthState,
+            payload);
+    }
+
+    public static byte[] Encode(InvitationUserAuthenticatePacket packet)
+    {
+        if (packet.AuthDigest.Length != 32)
+            throw new ArgumentException("AuthDigest must be exactly 32 bytes.", nameof(packet));
+
+        var namePayload     = EncodeNamePayload(packet.EndpointName, packet.ProductInstanceId);
+        var usernameBytes   = Encoding.UTF8.GetBytes(packet.UserName);
+        int usernameWords   = (usernameBytes.Length + 3) / 4;
+        var usernamePayload = new byte[usernameWords * 4]; // zero-padded
+        usernameBytes.CopyTo(usernamePayload, 0);
+
+        var payload = new byte[32 + namePayload.Length + usernamePayload.Length];
+        packet.AuthDigest.CopyTo(payload, 0);
+        namePayload.CopyTo(payload, 32);
+        usernamePayload.CopyTo(payload, 32 + namePayload.Length);
+
+        return EncodeDatagramSingle(
+            NetworkMidi2Command.InvitationUserAuthenticate,
+            csd1: (byte)NameWordCount(packet.EndpointName),
+            csd2: (byte)usernameWords,
+            payload);
+    }
+
     public static byte[] Encode(NakPacket packet)
         => EncodeDatagramSingle(NetworkMidi2Command.Nak, csd1: (byte)packet.Reason, csd2: 0, []);
 
@@ -339,6 +401,16 @@ public static class NetworkMidi2Protocol
         return HMACSHA256.HashData(key, nonce);
     }
 
+    /// <summary>
+    /// Computes the challenge-response digest for user authentication.
+    /// Returns HMAC-SHA-256 with the password hash as key and the 16-byte nonce as data.
+    /// </summary>
+    public static byte[] ComputeUserAuthDigest(string password, ReadOnlySpan<byte> nonce)
+    {
+        var key = SHA256.HashData(Encoding.UTF8.GetBytes(password));
+        return HMACSHA256.HashData(key, nonce);
+    }
+
     /// <summary>Constant-time comparison of two byte spans.</summary>
     public static bool PinHashesEqual(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
         => CryptographicOperations.FixedTimeEquals(a, b);
@@ -393,10 +465,12 @@ public static class NetworkMidi2Protocol
             NetworkMidi2Command.Invitation         => ParseNamePacket(csd1, payload,
                 (n, p) => new InvitationPacket(n, p)),
             NetworkMidi2Command.InvitationAuthenticate => ParseAuthenticatePacket(csd1, payload),
+            NetworkMidi2Command.InvitationUserAuthenticate => ParseUserAuthenticatePacket(csd1, csd2, payload),
             NetworkMidi2Command.InvitationAccepted => ParseNamePacket(csd1, payload,
                 (n, p) => new InvitationAcceptedPacket(n, p)),
             NetworkMidi2Command.InvitationPending  => new InvitationPendingPacket(),
             NetworkMidi2Command.InvitationAuthenticationRequired => ParseAuthRequiredPacket(csd1, csd2, payload),
+            NetworkMidi2Command.InvitationUserAuthenticationRequired => ParseUserAuthRequiredPacket(csd1, csd2, payload),
             NetworkMidi2Command.Ping               => ParsePingId(payload,
                 id => new PingPacket(id)),
             NetworkMidi2Command.PingReply          => ParsePingId(payload,
@@ -471,6 +545,39 @@ public static class NetworkMidi2Protocol
         string name = DecodeWordPaddedString(payload.Slice(16, nameBytes), Encoding.UTF8);
         string prod = DecodeWordPaddedString(payload[(16 + nameBytes)..], Encoding.ASCII);
         return new InvitationAuthenticationRequiredPacket(nonce, name, prod, authState);
+    }
+
+    private static InvitationUserAuthenticationRequiredPacket? ParseUserAuthRequiredPacket(
+        byte nameWordCount, byte authState, ReadOnlySpan<byte> payload)
+    {
+        // Payload = [16-byte nonce][name (word-padded)][product ID]
+        if (payload.Length < 16) return null;
+        var nonce = payload[..16].ToArray();
+        int nameBytes = nameWordCount * 4;
+        if (payload.Length < 16 + nameBytes) return null;
+        string name = DecodeWordPaddedString(payload.Slice(16, nameBytes), Encoding.UTF8);
+        string prod = DecodeWordPaddedString(payload[(16 + nameBytes)..], Encoding.ASCII);
+        return new InvitationUserAuthenticationRequiredPacket(nonce, name, prod, authState);
+    }
+
+    private static InvitationUserAuthenticatePacket? ParseUserAuthenticatePacket(
+        byte nameWordCount, byte usernameWordCount, ReadOnlySpan<byte> payload)
+    {
+        // Payload = [32-byte digest][name (word-padded)][product ID][username (word-padded)]
+        if (payload.Length < 32) return null;
+        var digest = payload[..32].ToArray();
+        int nameBytes = nameWordCount * 4;
+        if (payload.Length < 32 + nameBytes) return null;
+        string name = DecodeWordPaddedString(payload.Slice(32, nameBytes), Encoding.UTF8);
+        int usernameBytes = usernameWordCount * 4;
+        int prodStart = 32 + nameBytes;
+        int prodBytes = payload.Length - prodStart - usernameBytes;
+        if (prodBytes < 0) return null;
+        string prod = DecodeWordPaddedString(payload.Slice(prodStart, prodBytes), Encoding.ASCII);
+        string username = usernameBytes > 0
+            ? DecodeWordPaddedString(payload.Slice(prodStart + prodBytes, usernameBytes), Encoding.UTF8)
+            : string.Empty;
+        return new InvitationUserAuthenticatePacket(digest, name, prod, username);
     }
 
     /// <summary>
