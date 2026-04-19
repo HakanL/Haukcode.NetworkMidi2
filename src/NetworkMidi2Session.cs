@@ -364,8 +364,9 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     private async Task<IPEndPoint> AcceptAsHostAsync(CancellationToken ct)
     {
-        // Tracks pending auth: maps client endpoint → nonce we sent
-        var pendingAuth = new Dictionary<string, byte[]>();
+        // Tracks pending auth: maps client endpoint → (nonce we sent, retryCount)
+        var pendingAuth   = new Dictionary<string, byte[]>();
+        var pendingRetry  = new HashSet<string>();
 
         while (true)
         {
@@ -386,6 +387,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         // Generate a nonce and challenge the client
                         var nonce = RandomNumberGenerator.GetBytes(16);
                         pendingAuth[clientKey] = nonce;
+                        pendingRetry.Remove(clientKey);
 
                         var challenge = new InvitationAuthenticationRequiredPacket(
                             nonce, localName, "", AuthState: 0);
@@ -423,6 +425,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                     if (NetworkMidi2Protocol.PinHashesEqual(authResponse.AuthDigest, expectedDigest))
                     {
                         pendingAuth.Remove(clientKey);
+                        pendingRetry.Remove(clientKey);
                         RemoteName = authResponse.EndpointName;
                         var accepted = new InvitationAcceptedPacket(localName);
                         if (TraceHook != null)
@@ -433,33 +436,31 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
                         return (IPEndPoint)result.RemoteEndPoint;
                     }
+                    else if (!pendingRetry.Contains(clientKey))
+                    {
+                        // Wrong PIN — allow one retry with a new nonce
+                        var nonce = RandomNumberGenerator.GetBytes(16);
+                        pendingAuth[clientKey] = nonce;
+                        pendingRetry.Add(clientKey);
+
+                        var challenge = new InvitationAuthenticationRequiredPacket(
+                            nonce, localName, "", AuthState: 1);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX InvitationAuthenticationRequired (retry) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(challenge),
+                            result.RemoteEndPoint, ct);
+                    }
                     else
                     {
-                        // Wrong PIN — retry once with a new nonce then reject
-                        var nonce = RandomNumberGenerator.GetBytes(16);
-                        var authState = (byte)(pendingAuth.ContainsKey(clientKey + "_retry") ? 1 : 0);
-                        if (authState == 0)
-                        {
-                            pendingAuth[clientKey] = nonce;
-                            pendingAuth[clientKey + "_retry"] = [];
-                            var challenge = new InvitationAuthenticationRequiredPacket(
-                                nonce, localName, "", AuthState: 1);
-                            if (TraceHook != null)
-                                TraceHook($"[{localName}] TX InvitationAuthenticationRequired (retry) to {result.RemoteEndPoint}");
-                            await socket.SendAsync(
-                                NetworkMidi2Protocol.Encode(challenge),
-                                result.RemoteEndPoint, ct);
-                        }
-                        else
-                        {
-                            pendingAuth.Remove(clientKey);
-                            pendingAuth.Remove(clientKey + "_retry");
-                            if (TraceHook != null)
-                                TraceHook($"[{localName}] TX Bye (AuthFailed) to {result.RemoteEndPoint}");
-                            await socket.SendAsync(
-                                NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.AuthFailed)),
-                                result.RemoteEndPoint, ct);
-                        }
+                        // Second failure — reject
+                        pendingAuth.Remove(clientKey);
+                        pendingRetry.Remove(clientKey);
+                        if (TraceHook != null)
+                            TraceHook($"[{localName}] TX Bye (AuthFailed) to {result.RemoteEndPoint}");
+                        await socket.SendAsync(
+                            NetworkMidi2Protocol.Encode(new ByePacket(ByeReason.AuthFailed)),
+                            result.RemoteEndPoint, ct);
                     }
                 }
             }

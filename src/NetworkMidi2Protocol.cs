@@ -493,6 +493,8 @@ public static class NetworkMidi2Protocol
 
     /// <summary>
     /// Parses a list of 16-bit sequence numbers packed two per 32-bit word (big-endian).
+    /// The encoder always pads to an even number of bytes (full 32-bit words), so
+    /// any trailing padding byte is naturally skipped by integer division.
     /// </summary>
     private static ushort[] ParseSequenceNumbers(ReadOnlySpan<byte> payload)
     {
