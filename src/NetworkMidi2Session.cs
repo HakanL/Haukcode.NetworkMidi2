@@ -259,8 +259,22 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     // Reconnect loops
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Upper bound on the exponential-backoff delay applied by
+    /// <see cref="ConnectWithReconnectAsync"/> and
+    /// <see cref="ListenWithReconnectAsync"/> when the peer keeps rejecting
+    /// us (e.g. bridge with no USB device, wrong IP, partitioned network).
+    /// The delay starts at the caller-supplied initial value and doubles
+    /// after every failed attempt, capped here so retries keep going forever
+    /// but at a sane rate. Resets to the initial value on every successful
+    /// handshake.
+    /// </summary>
+    public static readonly TimeSpan MaxReconnectDelay = TimeSpan.FromSeconds(30);
+
     public async Task ConnectWithReconnectAsync(IPEndPoint endPoint, TimeSpan reconnectDelay, CancellationToken ct = default)
     {
+        var currentDelay = reconnectDelay;
+
         while (!ct.IsCancellationRequested)
         {
             var sessionEndedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -268,9 +282,12 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 .Where(s => s == SessionState.Idle)
                 .Subscribe(_ => sessionEndedTcs.TrySetResult());
 
+            bool handshakeSucceeded = false;
             try
             {
                 await ConnectAsync(endPoint, ct);
+                handshakeSucceeded = true;
+                currentDelay       = reconnectDelay;    // reset backoff on success
                 await sessionEndedTcs.Task.WaitAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -278,13 +295,21 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
             if (ct.IsCancellationRequested) return;
 
-            try { await Task.Delay(reconnectDelay, ct); }
+            try { await Task.Delay(currentDelay, ct); }
             catch (OperationCanceledException) { return; }
+
+            // Only grow the delay when the handshake itself failed. A successful
+            // session that ended normally (peer Bye, silence timeout, ...) was
+            // already reset above, so we go back out at the initial cadence.
+            if (!handshakeSucceeded)
+                currentDelay = GrowBackoff(currentDelay);
         }
     }
 
     public async Task ListenWithReconnectAsync(int port, TimeSpan reconnectDelay, CancellationToken ct = default)
     {
+        var currentDelay = reconnectDelay;
+
         while (!ct.IsCancellationRequested)
         {
             var sessionEndedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -292,9 +317,12 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 .Where(s => s == SessionState.Idle)
                 .Subscribe(_ => sessionEndedTcs.TrySetResult());
 
+            bool handshakeSucceeded = false;
             try
             {
                 await ListenAsync(port, ct);
+                handshakeSucceeded = true;
+                currentDelay       = reconnectDelay;
                 await sessionEndedTcs.Task.WaitAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -302,9 +330,18 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
             if (ct.IsCancellationRequested) return;
 
-            try { await Task.Delay(reconnectDelay, ct); }
+            try { await Task.Delay(currentDelay, ct); }
             catch (OperationCanceledException) { return; }
+
+            if (!handshakeSucceeded)
+                currentDelay = GrowBackoff(currentDelay);
         }
+    }
+
+    private static TimeSpan GrowBackoff(TimeSpan current)
+    {
+        var doubled = TimeSpan.FromMilliseconds(current.TotalMilliseconds * 2.0);
+        return doubled > MaxReconnectDelay ? MaxReconnectDelay : doubled;
     }
 
     // -------------------------------------------------------------------------
@@ -359,10 +396,16 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         if (cmd is InvitationPendingPacket)
                         {
                             if (TraceHook != null)
-                                TraceHook($"[{localName}] RX InvitationPending — host is busy, will retry");
-                            // Break inner loop to trigger outer retry with delay
-                            await Task.Delay(500, ct);
-                            goto nextAttempt;
+                                TraceHook($"[{localName}] RX InvitationPending -- host is busy");
+                            // Host is deliberately asking us to back off. Don't
+                            // tight-retry within this handshake -- that burns 3
+                            // more invites + 3 more Pending responses in ~1.5s
+                            // for nothing. Throw; the caller (typically
+                            // ConnectWithReconnectAsync) applies its reconnect
+                            // delay, with exponential backoff when persistent
+                            // rejection is observed.
+                            throw new TimeoutException(
+                                $"Network MIDI 2.0 host at {remoteEndPoint} is busy (InvitationPending).");
                         }
 
                         if (cmd is InvitationAuthenticationRequiredPacket authRequired)
