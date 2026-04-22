@@ -20,13 +20,26 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     private const int HandshakeTimeoutMs     = 5_000;
 
     /// <summary>
-    /// Max silence from the remote before the session is considered dead.
-    /// Covers three missed ping cycles plus slack — the canonical failure
-    /// mode is "peer rebooted without sending Bye" (no TCP connection to
-    /// break; UDP just goes silent). Stays symmetric with the firmware
-    /// bridge's 35 s silence timeout on the other side.
+    /// Maximum silence from the peer before the session is considered dead
+    /// and torn down. Every inbound packet (Ping, PingReply, UMP, Bye...)
+    /// resets the timer; a dedicated watchdog task wakes periodically and,
+    /// if the gap has grown past this value while the session is Connected,
+    /// fires <see cref="DisconnectAsync"/>.
+    ///
+    /// Default: 30 s. Pings are exchanged every 10 s, so 30 s is three
+    /// missed heartbeats — reliably "peer is gone" without the overly-long
+    /// waits of older reference implementations that use 60 s. Reduce
+    /// (e.g. to 1-2 s) in tests; do not set below
+    /// <see cref="MinimumPeerLivenessTimeout"/>.
     /// </summary>
-    private const int PeerSilenceTimeoutMs   = 35_000;
+    public TimeSpan PeerLivenessTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Floor for <see cref="PeerLivenessTimeout"/>. Values below this are
+    /// silently clamped up: any shorter than ~100 ms risks false positives
+    /// from ordinary OS scheduling jitter on busy systems.
+    /// </summary>
+    public static readonly TimeSpan MinimumPeerLivenessTimeout = TimeSpan.FromMilliseconds(100);
 
     private readonly string localName;
 
@@ -49,6 +62,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     private CancellationTokenSource? loopCts;
     private Task? receiveTask;
     private Task? pingTask;
+    private Task? livenessTask;
 
     // --- Outbound sequence tracking (uint16, wraps at 0xFFFF) ---
     private ushort outboundSeqNum;
@@ -66,9 +80,11 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     // --- Peer-liveness watchdog ---
     // Bumped every time ReceiveLoopAsync successfully parses an inbound
-    // datagram. PingLoopAsync compares against PeerSilenceTimeoutMs and
-    // tears down the session if the remote has been silent too long.
-    private DateTime lastPeerActivityUtc;
+    // datagram. PeerLivenessLoopAsync compares against PeerLivenessTimeout
+    // and tears down the session if the remote has been silent too long.
+    // Named to match Haukcode.RtpMidi's lastPacketRxUtc for easy side-by-
+    // side reading of the two watchdogs.
+    private DateTime lastPacketRxUtc;
 
     // -------------------------------------------------------------------------
     // Construction
@@ -621,7 +637,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
                 // Any parseable inbound from the remote counts as liveness
                 // — Ping/PingReply/UMP/Bye/etc. all bump the watchdog.
-                lastPeerActivityUtc = DateTime.UtcNow;
+                lastPacketRxUtc = DateTime.UtcNow;
 
                 // Collect all UMP Data packets in datagram order (oldest FEC history first)
                 var umpPackets    = cmds.OfType<UmpDataPacket>().ToList();
@@ -827,20 +843,6 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 await Task.Delay(DefaultPingIntervalMs, ct);
                 if (State != SessionState.Connected) continue;
 
-                // Peer-silence watchdog. If ReceiveLoopAsync hasn't seen any
-                // parseable inbound from the remote in too long, the session
-                // is dead (remote rebooted without Bye, or the network is
-                // partitioned). Tear down so the caller's reconnect logic
-                // can fire — otherwise State stays Connected forever.
-                var silenceMs = (DateTime.UtcNow - lastPeerActivityUtc).TotalMilliseconds;
-                if (silenceMs > PeerSilenceTimeoutMs)
-                {
-                    TraceHook?.Invoke(
-                        $"[{localName}] peer silent for {silenceMs:F0}ms -- disconnecting");
-                    _ = DisconnectAsync();
-                    return;
-                }
-
                 var pingId = NetworkMidi2Protocol.GeneratePingId();
                 if (TraceHook != null)
                     TraceHook($"[{localName}] TX Ping id={pingId:X8}");
@@ -855,7 +857,9 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 {
                     // Transient SocketException (ICMP port-unreachable after
                     // remote reboot), ObjectDisposed, etc. End the session
-                    // so the caller observes a state change.
+                    // so the caller observes a state change. The liveness
+                    // watchdog would catch this eventually anyway, but
+                    // reacting to the immediate send failure is crisper.
                     TraceHook?.Invoke(
                         $"[{localName}] ping send failed: {ex.GetType().Name}: {ex.Message} -- disconnecting");
                     _ = DisconnectAsync();
@@ -875,6 +879,69 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         }
     }
 
+    /// <summary>
+    /// Peer-liveness watchdog. Runs alongside the ping loop on its own
+    /// cadence — a fraction of <see cref="PeerLivenessTimeout"/> so detection
+    /// latency is within ~25% of the configured timeout regardless of how
+    /// short or long the user picks. If the remote has been silent for longer
+    /// than <see cref="PeerLivenessTimeout"/> while we're Connected we
+    /// conclude the session is dead (peer crashed, network partitioned,
+    /// reboot without Bye) and tear down. <see cref="DisconnectAsync"/>
+    /// fires <see cref="StateChanges"/> so callers using
+    /// <see cref="ConnectWithReconnectAsync"/> /
+    /// <see cref="ListenWithReconnectAsync"/> can re-establish automatically.
+    ///
+    /// Mirrors PeerLivenessLoopAsync in Haukcode.RtpMidi.
+    /// </summary>
+    private async Task PeerLivenessLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                // Effective timeout respects the MinimumPeerLivenessTimeout
+                // floor so callers can't accidentally tune the watchdog into
+                // false-positive territory.
+                var timeout = PeerLivenessTimeout < MinimumPeerLivenessTimeout
+                    ? MinimumPeerLivenessTimeout
+                    : PeerLivenessTimeout;
+
+                // Check roughly four times per timeout window so detection is
+                // within ~25% of the configured value. Clamped: tests can set
+                // short timeouts and still get prompt detection.
+                var tick = TimeSpan.FromMilliseconds(
+                    Math.Max(MinimumPeerLivenessTimeout.TotalMilliseconds / 2.0,
+                             timeout.TotalMilliseconds / 4.0));
+
+                await Task.Delay(tick, ct);
+
+                if (State != SessionState.Connected) continue;
+
+                if ((DateTime.UtcNow - lastPacketRxUtc) > timeout)
+                {
+                    if (TraceHook != null)
+                        TraceHook($"[{localName}] peer silent for > {timeout}, tearing down session");
+                    // Fire-and-forget: DisconnectAsync cancels and awaits the
+                    // loop tasks, so awaiting from here would deadlock.
+                    _ = DisconnectAsync();
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // The liveness watchdog is the last line of defense against a
+            // silently dead session. If IT dies silently the user never
+            // learns the peer is gone. Log via the trace hook and fire a
+            // disconnect — better a noisy false teardown than a quiet hang.
+            if (TraceHook != null)
+                TraceHook($"[{localName}] peer-liveness loop aborted unexpectedly: {ex.GetType().Name}: {ex.Message}; triggering disconnect");
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Loop lifecycle
     // -------------------------------------------------------------------------
@@ -882,19 +949,20 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     private void StartLoops(CancellationToken ct)
     {
         // Seed liveness: the handshake just completed, so treat that as
-        // fresh peer activity. Without this the watchdog in PingLoopAsync
-        // could fire on the very first tick after a long-idle process.
-        lastPeerActivityUtc = DateTime.UtcNow;
+        // fresh peer activity. Without this the watchdog could fire on the
+        // very first tick after a long-idle process.
+        lastPacketRxUtc = DateTime.UtcNow;
 
-        loopCts     = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        receiveTask = ReceiveLoopAsync(loopCts.Token);
-        pingTask    = PingLoopAsync(loopCts.Token);
+        loopCts      = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        receiveTask  = ReceiveLoopAsync(loopCts.Token);
+        pingTask     = PingLoopAsync(loopCts.Token);
+        livenessTask = PeerLivenessLoopAsync(loopCts.Token);
     }
 
     private async Task StopLoopsAsync()
     {
         loopCts?.Cancel();
-        var tasks = new[] { receiveTask, pingTask }.Where(t => t != null).Select(t => t!);
+        var tasks = new[] { receiveTask, pingTask, livenessTask }.Where(t => t != null).Select(t => t!);
         try { await Task.WhenAll(tasks); } catch { }
         loopCts?.Dispose();
         loopCts = null;
