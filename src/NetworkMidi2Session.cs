@@ -16,8 +16,17 @@ namespace Haukcode.NetworkMidi2;
 /// </summary>
 public sealed class NetworkMidi2Session : INetworkMidi2Session
 {
-    private const int DefaultPingIntervalMs = 10_000;
-    private const int HandshakeTimeoutMs    = 5_000;
+    private const int DefaultPingIntervalMs  = 10_000;
+    private const int HandshakeTimeoutMs     = 5_000;
+
+    /// <summary>
+    /// Max silence from the remote before the session is considered dead.
+    /// Covers three missed ping cycles plus slack — the canonical failure
+    /// mode is "peer rebooted without sending Bye" (no TCP connection to
+    /// break; UDP just goes silent). Stays symmetric with the firmware
+    /// bridge's 35 s silence timeout on the other side.
+    /// </summary>
+    private const int PeerSilenceTimeoutMs   = 35_000;
 
     private readonly string localName;
 
@@ -54,6 +63,12 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     // --- Inbound gap detection ---
     private ushort? expectedSeqNum;
+
+    // --- Peer-liveness watchdog ---
+    // Bumped every time ReceiveLoopAsync successfully parses an inbound
+    // datagram. PingLoopAsync compares against PeerSilenceTimeoutMs and
+    // tears down the session if the remote has been silent too long.
+    private DateTime lastPeerActivityUtc;
 
     // -------------------------------------------------------------------------
     // Construction
@@ -604,6 +619,10 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 var result = await socket!.ReceiveAsync(ct);
                 if (!NetworkMidi2Protocol.TryParseAll(result.Buffer, out var cmds)) continue;
 
+                // Any parseable inbound from the remote counts as liveness
+                // — Ping/PingReply/UMP/Bye/etc. all bump the watchdog.
+                lastPeerActivityUtc = DateTime.UtcNow;
+
                 // Collect all UMP Data packets in datagram order (oldest FEC history first)
                 var umpPackets    = cmds.OfType<UmpDataPacket>().ToList();
                 var expectedBefore = expectedSeqNum;
@@ -678,10 +697,17 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             }
         }
         catch (OperationCanceledException) { }
-        catch (System.Net.Sockets.SocketException)
+        catch (Exception ex)
         {
+            // Broad catch (previously SocketException only): ObjectDisposed,
+            // InvalidOperation, etc. would otherwise silently fault the task
+            // and leave State stuck at Connected forever.
             if (State == SessionState.Connected)
+            {
+                TraceHook?.Invoke(
+                    $"[{localName}] receive loop faulted: {ex.GetType().Name}: {ex.Message} -- disconnecting");
                 _ = DisconnectAsync();
+            }
         }
     }
 
@@ -801,14 +827,52 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 await Task.Delay(DefaultPingIntervalMs, ct);
                 if (State != SessionState.Connected) continue;
 
+                // Peer-silence watchdog. If ReceiveLoopAsync hasn't seen any
+                // parseable inbound from the remote in too long, the session
+                // is dead (remote rebooted without Bye, or the network is
+                // partitioned). Tear down so the caller's reconnect logic
+                // can fire — otherwise State stays Connected forever.
+                var silenceMs = (DateTime.UtcNow - lastPeerActivityUtc).TotalMilliseconds;
+                if (silenceMs > PeerSilenceTimeoutMs)
+                {
+                    TraceHook?.Invoke(
+                        $"[{localName}] peer silent for {silenceMs:F0}ms -- disconnecting");
+                    _ = DisconnectAsync();
+                    return;
+                }
+
                 var pingId = NetworkMidi2Protocol.GeneratePingId();
                 if (TraceHook != null)
                     TraceHook($"[{localName}] TX Ping id={pingId:X8}");
-                await socket!.SendAsync(
-                    NetworkMidi2Protocol.Encode(new PingPacket(pingId)), ct);
+
+                try
+                {
+                    await socket!.SendAsync(
+                        NetworkMidi2Protocol.Encode(new PingPacket(pingId)), ct);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // Transient SocketException (ICMP port-unreachable after
+                    // remote reboot), ObjectDisposed, etc. End the session
+                    // so the caller observes a state change.
+                    TraceHook?.Invoke(
+                        $"[{localName}] ping send failed: {ex.GetType().Name}: {ex.Message} -- disconnecting");
+                    _ = DisconnectAsync();
+                    return;
+                }
             }
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // Any other unexpected failure in the ping loop is a latent
+            // "stuck Connected" bug if we let it silently fault. Surface it.
+            TraceHook?.Invoke(
+                $"[{localName}] ping loop faulted: {ex.GetType().Name}: {ex.Message} -- disconnecting");
+            if (State == SessionState.Connected)
+                _ = DisconnectAsync();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -817,6 +881,11 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
 
     private void StartLoops(CancellationToken ct)
     {
+        // Seed liveness: the handshake just completed, so treat that as
+        // fresh peer activity. Without this the watchdog in PingLoopAsync
+        // could fire on the very first tick after a long-idle process.
+        lastPeerActivityUtc = DateTime.UtcNow;
+
         loopCts     = CancellationTokenSource.CreateLinkedTokenSource(ct);
         receiveTask = ReceiveLoopAsync(loopCts.Token);
         pingTask    = PingLoopAsync(loopCts.Token);
