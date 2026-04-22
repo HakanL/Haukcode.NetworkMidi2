@@ -47,6 +47,11 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     // --- FEC send-side history ---
     private readonly UmpFec.SendHistory fecHistory = new();
 
+    // Serialises SendUmpAsync so concurrent callers can't race the
+    // outboundSeqNum increment + GetHistory + Record sequence (which would
+    // otherwise reuse a sequence number or attach the wrong FEC history).
+    private readonly SemaphoreSlim sendGate = new(1, 1);
+
     // --- Inbound gap detection ---
     private ushort? expectedSeqNum;
 
@@ -149,16 +154,24 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
         if (State != SessionState.Connected)
             throw new InvalidOperationException("Not connected.");
 
-        ushort seqNum  = outboundSeqNum++;
-        var history    = fecHistory.GetHistory();
-        var datagram   = UmpFec.EncodeDatagram(seqNum, umpWords.Span, history);
+        await sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ushort seqNum  = outboundSeqNum++;
+            var history    = fecHistory.GetHistory();
+            var datagram   = UmpFec.EncodeDatagram(seqNum, umpWords.Span, history);
 
-        fecHistory.Record(seqNum, umpWords.ToArray());
+            fecHistory.Record(seqNum, umpWords.ToArray());
 
-        if (TraceHook != null)
-            TraceHook($"[{localName}] TX UMP seq={seqNum} words={umpWords.Length} fec={history.Count}");
+            if (TraceHook != null)
+                TraceHook($"[{localName}] TX UMP seq={seqNum} words={umpWords.Length} fec={history.Count}");
 
-        await socket!.SendAsync(datagram, ct);
+            await socket!.SendAsync(datagram, ct);
+        }
+        finally
+        {
+            sendGate.Release();
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -27,16 +27,31 @@ internal static class UmpFec
     {
         private readonly record struct Entry(ushort SequenceNumber, uint[] Words);
         private readonly Queue<Entry> queue = new(capacity: MaxHistory + 1);
+        // All access is gated to make concurrent Record + GetHistory safe.
+        // Without this lock, Queue<T>'s internal _array can grow / shift while
+        // an in-flight Select(...).ToList() is enumerating, producing
+        // default(Entry) values whose Words field is null. Callers (e.g.
+        // EncodeDatagram) then NRE on history[i].UmpWords.Length. Concrete
+        // repro: many UMP sends fired in parallel right after Connected.
+        private readonly object gate = new();
 
         public void Record(ushort sequenceNumber, uint[] umpWords)
         {
-            if (queue.Count >= MaxHistory) queue.Dequeue();
-            queue.Enqueue(new Entry(sequenceNumber, umpWords));
+            lock (gate)
+            {
+                if (queue.Count >= MaxHistory) queue.Dequeue();
+                queue.Enqueue(new Entry(sequenceNumber, umpWords));
+            }
         }
 
         /// <summary>Returns history entries oldest-first, at most <see cref="MaxHistory"/> entries.</summary>
         public IReadOnlyList<(ushort SeqNum, uint[] UmpWords)> GetHistory()
-            => queue.Select(e => (e.SequenceNumber, e.Words)).ToList();
+        {
+            lock (gate)
+            {
+                return queue.Select(e => (e.SequenceNumber, e.Words)).ToList();
+            }
+        }
 
         /// <summary>
         /// Tries to find a recorded entry by sequence number.
@@ -44,20 +59,29 @@ internal static class UmpFec
         /// </summary>
         public bool TryGet(ushort sequenceNumber, out uint[] umpWords)
         {
-            foreach (var entry in queue)
+            lock (gate)
             {
-                if (entry.SequenceNumber == sequenceNumber)
+                foreach (var entry in queue)
                 {
-                    umpWords = entry.Words;
-                    return true;
+                    if (entry.SequenceNumber == sequenceNumber)
+                    {
+                        umpWords = entry.Words;
+                        return true;
+                    }
                 }
+                umpWords = [];
+                return false;
             }
-            umpWords = [];
-            return false;
         }
 
         /// <summary>Clears all recorded history entries.</summary>
-        public void Clear() => queue.Clear();
+        public void Clear()
+        {
+            lock (gate)
+            {
+                queue.Clear();
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
