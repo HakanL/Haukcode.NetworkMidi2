@@ -592,9 +592,16 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                 if (!NetworkMidi2Protocol.TryParseAll(result.Buffer, out var cmds)) continue;
 
                 // Collect all UMP Data packets in datagram order (oldest FEC history first)
-                var umpPackets = cmds.OfType<UmpDataPacket>().ToList();
+                var umpPackets    = cmds.OfType<UmpDataPacket>().ToList();
+                var expectedBefore = expectedSeqNum;
                 foreach (var pkt in umpPackets)
                     HandleUmpDataPacket(pkt);
+
+                // After FEC has had a chance to fill the gap, request retransmit
+                // for any sequence numbers that are still missing. Bounded to avoid
+                // runaway requests after a long pause or large burst loss.
+                if (expectedBefore.HasValue && umpPackets.Count > 0)
+                    await RequestRetransmitIfGapAsync(expectedBefore.Value, umpPackets, ct);
 
                 foreach (var cmd in cmds)
                 {
@@ -663,6 +670,43 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             if (State == SessionState.Connected)
                 _ = DisconnectAsync();
         }
+    }
+
+    private const int MaxRetransmitRequestCount = 64;
+
+    private async Task RequestRetransmitIfGapAsync(
+        ushort expectedBefore,
+        List<UmpDataPacket> umpPackets,
+        CancellationToken ct)
+    {
+        // Find the lowest "new" sequence (>= expectedBefore under wraparound).
+        ushort? lowestNew = null;
+        foreach (var pkt in umpPackets)
+        {
+            if (!IsSequenceAtOrAfter(pkt.SequenceNumber, expectedBefore))
+                continue;
+            if (lowestNew is null || IsSequenceAtOrAfter(lowestNew.Value, pkt.SequenceNumber))
+                lowestNew = pkt.SequenceNumber;
+        }
+
+        if (lowestNew is null || lowestNew.Value == expectedBefore)
+            return;
+
+        var missing = new List<ushort>();
+        ushort s = expectedBefore;
+        while (s != lowestNew.Value && missing.Count < MaxRetransmitRequestCount)
+        {
+            missing.Add(s);
+            s++;
+        }
+
+        if (missing.Count == 0)
+            return;
+
+        if (TraceHook != null)
+            TraceHook($"[{localName}] TX Retransmit request seqs=[{string.Join(",", missing)}]");
+        await socket!.SendAsync(
+            NetworkMidi2Protocol.Encode(new RetransmitPacket([.. missing])), ct);
     }
 
     private async Task HandleRetransmitAsync(RetransmitPacket retransmit, CancellationToken ct)
