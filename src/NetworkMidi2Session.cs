@@ -103,6 +103,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
     public IObservable<ReadOnlyMemory<uint>> UmpReceived => umpSubject.AsObservable();
     public IObservable<SessionState> StateChanges        => stateSubject.AsObservable();
     public string? RemoteName { get; private set; }
+    public string? ProductInstanceId { get; private set; }
     public string? Pin { get; set; }
     public string? Username { get; set; }
     public string? Password { get; set; }
@@ -388,6 +389,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         if (cmd is InvitationAcceptedPacket accepted)
                         {
                             RemoteName = accepted.EndpointName;
+                            ProductInstanceId = accepted.ProductInstanceId;
                             if (TraceHook != null)
                                 TraceHook($"[{localName}] RX InvitationAccepted remote='{RemoteName}'");
                             return;
@@ -531,6 +533,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                     }
 
                     RemoteName = invite.EndpointName;
+                    ProductInstanceId = invite.ProductInstanceId;
                     var accepted = new InvitationAcceptedPacket(localName);
                     if (TraceHook != null)
                         TraceHook($"[{localName}] TX InvitationAccepted to {result.RemoteEndPoint}");
@@ -558,6 +561,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         pendingAuth.Remove(clientKey);
                         pendingRetry.Remove(clientKey);
                         RemoteName = authResponse.EndpointName;
+                        ProductInstanceId = authResponse.ProductInstanceId;
                         var accepted = new InvitationAcceptedPacket(localName);
                         if (TraceHook != null)
                             TraceHook($"[{localName}] TX InvitationAccepted (PIN OK) to {result.RemoteEndPoint}");
@@ -625,6 +629,7 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
                         pendingUserAuth.Remove(clientKey);
                         pendingUserRetry.Remove(clientKey);
                         RemoteName = userAuthResponse.EndpointName;
+                        ProductInstanceId = userAuthResponse.ProductInstanceId;
                         var accepted = new InvitationAcceptedPacket(localName);
                         if (TraceHook != null)
                             TraceHook($"[{localName}] TX InvitationAccepted (user auth OK) to {result.RemoteEndPoint}");

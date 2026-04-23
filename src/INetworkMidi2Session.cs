@@ -56,6 +56,14 @@ public interface INetworkMidi2Session : IAsyncDisposable
     string? RemoteName { get; }
 
     /// <summary>
+    /// Product instance ID advertised by the remote peer in the invitation
+    /// handshake, populated after connection. Hardware devices (e.g. the
+    /// DMXCore MIDI bridge) populate this from a unique hardware identifier
+    /// (STM32 UID); software peers typically send an empty string.
+    /// </summary>
+    string? ProductInstanceId { get; }
+
+    /// <summary>
     /// Optional PIN for authentication.
     /// Null (default) = open session (no authentication).
     /// When set on a client, the SHA-256 hash is sent in the Invitation.
