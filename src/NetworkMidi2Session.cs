@@ -464,7 +464,6 @@ public sealed class NetworkMidi2Session : INetworkMidi2Session
             {
                 // Inner 1 s retry expired — try again
             }
-            nextAttempt:;
         }
 
         throw new TimeoutException($"Network MIDI 2.0 handshake timed out for {remoteEndPoint}.");
